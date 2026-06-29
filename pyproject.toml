@@ -1,0 +1,61 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "cast-trophizer"
+version = "0.1.0"
+description = "Convert ebooks into full-cast audiobooks using Chatterbox TTS."
+requires-python = ">=3.11"
+readme = "README.md"
+dependencies = [
+    "PySide6>=6.6",            # Qt GUI
+    "ebooklib>=0.18",         # EPUB parsing
+    "beautifulsoup4>=4.12",   # HTML extraction within EPUB
+    "mutagen>=1.47",          # M4B tagging / chapters / cover
+    "anthropic>=0.39",        # primary LLM provider (Claude)
+    "openai>=1.40",           # backup LLM via LM Studio OpenAI-compatible endpoint
+]
+# Note: ffmpeg is an external binary dependency (not pip). Documented in README;
+# AssembleStage shells out to it.
+
+[project.optional-dependencies]
+# Heavy torch-based TTS gated behind an extra so dev/CI installs stay light.
+# Import path: `from chatterbox.tts import ChatterboxTTS` (dist: chatterbox-tts).
+tts = [
+    "chatterbox-tts",
+]
+dev = [
+    "pytest>=8",
+    "pytest-mock>=3.12",
+    "ruff>=0.6",
+    "black>=24",
+    "mypy>=1.11",
+]
+
+[project.scripts]
+casttrophizer = "casttrophizer.ui.app:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/casttrophizer"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.black]
+line-length = 100
+target-version = ["py311"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+files = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+addopts = "-q"
