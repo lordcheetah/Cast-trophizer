@@ -163,6 +163,38 @@ def sample_project(
 
 
 # --------------------------------------------------------------------------- #
+# a project ready to be parsed (no chapters yet)
+# --------------------------------------------------------------------------- #
+@pytest.fixture
+def parse_ready_project(
+    tmp_workspace: WorkspaceStore,
+    sample_epub: Path,
+) -> Project:
+    """A saved :class:`Project` pointing at ``sample_epub`` with no chapters parsed yet.
+
+    Mirrors the state the parse stage receives: ``book`` has the read-only source path but
+    empty chapters/metadata, and ``stage_status`` is empty (parse not yet run).
+    """
+    book = Book(
+        title="",
+        author="",
+        source_ebook_path=str(sample_epub),
+        cover_image_path=None,
+        chapters=[],
+    )
+    project = Project(
+        schema_version=CURRENT_SCHEMA_VERSION,
+        id=new_id("proj"),
+        name="Parse Ready",
+        workspace_dir=str(tmp_workspace.layout.root),
+        book=book,
+        stage_status={},
+    )
+    tmp_workspace.save(project)
+    return project
+
+
+# --------------------------------------------------------------------------- #
 # fakes
 # --------------------------------------------------------------------------- #
 @pytest.fixture

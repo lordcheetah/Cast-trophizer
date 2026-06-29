@@ -55,6 +55,11 @@ python_version = "3.11"
 strict = true
 files = ["src"]
 
+# Third-party EPUB/HTML libs ship no type stubs; allow importing them untyped.
+[[tool.mypy.overrides]]
+module = ["ebooklib", "ebooklib.*", "bs4", "bs4.*"]
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 testpaths = ["tests"]
