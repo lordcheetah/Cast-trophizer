@@ -1,15 +1,37 @@
 """SegmentAttributeStage: speaker tagging via the LLM.
 
-Splits lines into attributable segments and uses ``ctx.llm`` to set each segment's
-``speaker_id`` and ``confidence``. The LLM proposes; low-confidence attributions are
-flagged for review and never silently committed. Feature bodies are stubs in this
-skeleton.
+Runs after ``correct``. For each chapter it segments the chapter's *unattributed* lines
+offline (deterministic ``QuoteSegmenter``) into narration/quote ``Segment``s, then uses
+``ctx.llm`` to attribute the quote segments to speakers. The LLM proposes; low-confidence
+attributions are flagged ``NEEDS_REVIEW`` and never silently committed. Discovered character
+names are registered in ``project.speakers``. Narration is the narrator by construction and
+is never sent to the LLM.
+
+Resume/idempotency: the idempotency key is ``Line.segments`` — a line that already has
+segments is skipped (mirrors ``correct``'s skip-on-existing rule), so a re-run creates no
+duplicate segments and makes no extra LLM calls. The stop checkpoint is per chapter, with a
+partial persist, so a STOP resumes from the first chapter with unattributed lines.
+
+Provider policy: if ``ctx.llm`` is None or unavailable, return FAILED with ``stage_status``
+left unset (re-runnable). A malformed batch (handled inside the orchestration) is soft-
+flagged ``NEEDS_REVIEW`` rather than failing the stage; only a genuinely unreachable
+provider mid-run returns FAILED. The stage returns COMPLETED even with many segments left
+``NEEDS_REVIEW`` — the dedicated review stage/UI resolves them. Qt-free; no provider
+construction (``ctx.llm`` is injected).
 """
 
 from __future__ import annotations
 
-from casttrophizer.domain.enums import StageName
+from casttrophizer.attribution import (
+    ATTRIBUTION_CONFIDENCE_THRESHOLD,
+    Segmenter,
+    attribute_chapter,
+    default_segmenter,
+    ensure_narrator,
+)
+from casttrophizer.domain.enums import ReviewStatus, StageName
 from casttrophizer.domain.models import Project
+from casttrophizer.errors import LLMProviderError
 from casttrophizer.pipeline.stage import Stage, StageContext, StageResult
 
 __all__ = ["SegmentAttributeStage"]
@@ -20,8 +42,62 @@ class SegmentAttributeStage(Stage):
 
     name = StageName.ATTRIBUTE
 
+    def __init__(
+        self,
+        segmenter: Segmenter | None = None,
+        threshold: float = ATTRIBUTION_CONFIDENCE_THRESHOLD,
+    ) -> None:
+        """``segmenter`` overrides the default splitter (test injection); the LLM always
+        comes from ``ctx.llm``. ``threshold`` tunes the APPROVED/NEEDS_REVIEW gate."""
+        self._segmenter = segmenter or default_segmenter()
+        self._threshold = threshold
+
     def is_complete(self, project: Project) -> bool:
-        raise NotImplementedError("SegmentAttributeStage.is_complete is not yet implemented")
+        """True once attribute recorded COMPLETED in ``stage_status`` (purely status-driven)."""
+        return project.stage_status.get(str(StageName.ATTRIBUTE)) == ReviewStatus.COMPLETED
 
     def run(self, project: Project, ctx: StageContext) -> StageResult:
-        raise NotImplementedError("SegmentAttributeStage.run is not yet implemented")
+        """Attribute every chapter's unattributed lines, persist per chapter, record COMPLETED.
+
+        None-guards ``ctx.llm`` (FAILED, status unset). Iterates chapters as the stop
+        checkpoint; per chapter, skips already-attributed lines and attributes the rest. On
+        a genuinely unreachable provider mid-run, persists partial progress and returns
+        FAILED (re-runnable). Malformed batches are soft-flagged inside the orchestration.
+        """
+        if ctx.llm is None:
+            return StageResult(self.name, ReviewStatus.FAILED, "no LLM provider configured")
+        if not ctx.llm.is_available():
+            return StageResult(
+                self.name, ReviewStatus.FAILED, f"LLM provider {ctx.llm.name} unavailable"
+            )
+
+        narrator = ensure_narrator(project)
+        chapters = project.book.chapters
+        ctx.progress.set_total(len(chapters))
+
+        try:
+            for chapter in chapters:
+                if ctx.progress.should_stop():
+                    ctx.store.save(project)  # persist completed chapters; status stays unset
+                    return StageResult(self.name, ReviewStatus.STOPPED, "stopped during attribute")
+
+                todo = [line for line in chapter.lines if not line.segments]
+                if todo:
+                    attribute_chapter(
+                        chapter,
+                        todo,
+                        narrator,
+                        project,
+                        ctx.llm,
+                        self._segmenter,
+                        self._threshold,
+                    )
+                    ctx.store.save(project)  # chapter-granular persist for crash/resume safety
+                ctx.progress.advance(1, message=chapter.title)
+        except LLMProviderError as exc:
+            ctx.store.save(project)  # keep partial progress; re-runnable once provider is back
+            return StageResult(self.name, ReviewStatus.FAILED, str(exc))
+
+        project.stage_status[str(StageName.ATTRIBUTE)] = ReviewStatus.COMPLETED
+        ctx.store.save(project)
+        return StageResult(self.name, ReviewStatus.COMPLETED, "speakers attributed")

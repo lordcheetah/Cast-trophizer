@@ -251,6 +251,70 @@ def correct_ready_project(
 
 
 # --------------------------------------------------------------------------- #
+# a project ready to be attributed (parsed + corrected, no segments yet)
+# --------------------------------------------------------------------------- #
+@pytest.fixture
+def attribute_ready_project(
+    tmp_workspace: WorkspaceStore,
+    sample_epub: Path,
+) -> Project:
+    """A saved, parsed+corrected :class:`Project` whose lines carry known dialogue.
+
+    ``stage_status[PARSE]=COMPLETED`` and ``[CORRECT]=COMPLETED``; ``Line.segments`` is
+    empty everywhere (segmentation/attribution is this stage's job). Two chapters with
+    hand-built lines so attribution assertions are exact:
+
+    * a narrator-only line (no quotes);
+    * ``"Hello," said Alice.`` (narration + a quote);
+    * ``"Hi," Bob replied.`` (narration + a quote);
+    * an empty line (yields zero segments);
+    * a second chapter with one more quote line (for stop/resume + batching tests).
+
+    ``project.speakers`` starts empty so the narrator-auto-creation path is exercised.
+    """
+
+    def _line(ch_id: str, order: int, text: str) -> Line:
+        return Line(id=new_id("line"), chapter_id=ch_id, order=order, text=text, segments=[])
+
+    c1 = new_id("ch")
+    ch1_lines = [
+        _line(c1, 0, "The hall was silent."),  # narrator-only
+        _line(c1, 1, '"Hello," said Alice.'),  # narration + quote
+        _line(c1, 2, '"Hi," Bob replied.'),  # narration + quote
+        _line(c1, 3, ""),  # empty -> zero segments
+    ]
+    c2 = new_id("ch")
+    ch2_lines = [
+        _line(c2, 0, '"We meet again," said Alice.'),  # quote reusing Alice
+    ]
+    chapters = [
+        Chapter(id=c1, order=0, title="Chapter One", lines=ch1_lines),
+        Chapter(id=c2, order=1, title="Chapter Two", lines=ch2_lines),
+    ]
+
+    book = Book(
+        title="A Sample Tale",
+        author="Test Author",
+        source_ebook_path=str(sample_epub),
+        cover_image_path=None,
+        chapters=chapters,
+    )
+    project = Project(
+        schema_version=CURRENT_SCHEMA_VERSION,
+        id=new_id("proj"),
+        name="Attribute Ready",
+        workspace_dir=str(tmp_workspace.layout.root),
+        book=book,
+        stage_status={
+            str(StageName.PARSE): ReviewStatus.COMPLETED,
+            str(StageName.CORRECT): ReviewStatus.COMPLETED,
+        },
+    )
+    tmp_workspace.save(project)
+    return project
+
+
+# --------------------------------------------------------------------------- #
 # fakes
 # --------------------------------------------------------------------------- #
 @pytest.fixture

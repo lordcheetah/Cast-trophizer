@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import subprocess
 import sys
+import textwrap
 
 import pytest
 
@@ -53,19 +55,35 @@ def test_unknown_tts_provider_raises() -> None:
         build_tts_provider(AppConfig(tts_provider="nope"))
 
 
+def _assert_import_loads_no_sdks(module: str, forbidden: tuple[str, ...]) -> None:
+    """Import ``module`` in a FRESH interpreter and assert no ``forbidden`` SDK loads.
+
+    A clean subprocess (mirroring ``tests/test_lazy_imports.py``) is required: ``anthropic``
+    is installed and another test in the same session may legitimately exercise a provider
+    method that imports it (e.g. ``attribute_speakers`` references ``anthropic.AnthropicError``).
+    An in-process ``not in sys.modules`` check would then fail purely on test ordering — a
+    false positive about *this* module's import graph.
+    """
+    code = textwrap.dedent(f"""
+        import sys, importlib
+        importlib.import_module({module!r})
+        leaked = [m for m in {forbidden!r} if m in sys.modules]
+        if leaked:
+            sys.stderr.write(f"{module} leaked: " + ", ".join(leaked) + "\\n")
+            raise SystemExit(1)
+        raise SystemExit(0)
+        """)
+    proc = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+    assert proc.returncode == 0, f"{module} must import no heavy SDK.\nstderr:\n{proc.stderr}"
+
+
 def test_importing_providers_package_does_not_import_heavy_sdks() -> None:
     # Importing the factory package must not pull in anthropic/openai/torch/chatterbox.
-    import casttrophizer.providers  # noqa: F401
-
-    assert "anthropic" not in sys.modules
-    assert "openai" not in sys.modules
-    assert "torch" not in sys.modules
-    assert "chatterbox" not in sys.modules
+    _assert_import_loads_no_sdks(
+        "casttrophizer.providers", ("anthropic", "openai", "torch", "chatterbox")
+    )
 
 
 def test_importing_chatterbox_provider_module_does_not_import_torch() -> None:
     # The provider module must be import-cheap: torch loads only when synthesize runs.
-    import casttrophizer.providers.tts.chatterbox  # noqa: F401
-
-    assert "torch" not in sys.modules
-    assert "chatterbox" not in sys.modules
+    _assert_import_loads_no_sdks("casttrophizer.providers.tts.chatterbox", ("torch", "chatterbox"))

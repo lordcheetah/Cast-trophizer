@@ -49,6 +49,12 @@ _LAZY_IMPORT_CASES: list[tuple[str, str]] = [
     ("casttrophizer.pipeline", "PySide6"),
     ("casttrophizer.pipeline.stages", "anthropic"),
     ("casttrophizer.pipeline.stages", "openai"),
+    # The offline attribution package (segmenter/policy/orchestration) must stay SDK-free; only
+    # the Claude provider — reached via ctx.llm, never imported here — may touch anthropic.
+    ("casttrophizer.attribution", "anthropic"),
+    ("casttrophizer.attribution", "openai"),
+    ("casttrophizer.pipeline.stages.attribute", "anthropic"),
+    ("casttrophizer.pipeline.stages.attribute", "openai"),
     # The text-correction package must not load the spellcheck dictionary at import time
     # (the heavy ``spellchecker`` import is deferred into the corrector, like ebooklib).
     ("casttrophizer.text", "spellchecker"),

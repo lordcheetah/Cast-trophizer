@@ -49,7 +49,17 @@ class ProviderError(CasttrophizerError):
 
 
 class LLMProviderError(ProviderError):
-    """An LLM provider failed or is unavailable."""
+    """An LLM provider failed or is unavailable.
+
+    ``malformed`` distinguishes a recoverable parse/shape failure (non-JSON output, a
+    response that covers none of the requested segment ids) from a genuine reachability
+    failure (network/credentials). The attribution orchestration retries-then-soft-flags a
+    ``malformed=True`` error but lets a reachability error propagate to FAILED.
+    """
+
+    def __init__(self, *args: object, malformed: bool = False) -> None:
+        super().__init__(*args)
+        self.malformed = malformed
 
 
 class TTSProviderError(ProviderError):
