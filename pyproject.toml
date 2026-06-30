@@ -12,6 +12,7 @@ dependencies = [
     "PySide6>=6.6",            # Qt GUI
     "ebooklib>=0.18",         # EPUB parsing
     "beautifulsoup4>=4.12",   # HTML extraction within EPUB
+    "pyspellchecker>=0.8",    # offline spellcheck (bundled dict) for text correction
     "mutagen>=1.47",          # M4B tagging / chapters / cover
     "anthropic>=0.39",        # primary LLM provider (Claude)
     "openai>=1.40",           # backup LLM via LM Studio OpenAI-compatible endpoint
@@ -57,7 +58,7 @@ files = ["src"]
 
 # Third-party EPUB/HTML libs ship no type stubs; allow importing them untyped.
 [[tool.mypy.overrides]]
-module = ["ebooklib", "ebooklib.*", "bs4", "bs4.*"]
+module = ["ebooklib", "ebooklib.*", "bs4", "bs4.*", "spellchecker", "spellchecker.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

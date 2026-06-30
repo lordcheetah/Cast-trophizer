@@ -49,6 +49,13 @@ _LAZY_IMPORT_CASES: list[tuple[str, str]] = [
     ("casttrophizer.pipeline", "PySide6"),
     ("casttrophizer.pipeline.stages", "anthropic"),
     ("casttrophizer.pipeline.stages", "openai"),
+    # The text-correction package must not load the spellcheck dictionary at import time
+    # (the heavy ``spellchecker`` import is deferred into the corrector, like ebooklib).
+    ("casttrophizer.text", "spellchecker"),
+    ("casttrophizer.text.spelling", "spellchecker"),  # the module that *wraps* it
+    ("casttrophizer.text.base", "spellchecker"),  # the policy seam stays dict-free
+    ("casttrophizer.text.ocr", "spellchecker"),  # OCR heuristics take an injected is_word
+    ("casttrophizer.pipeline.stages.correct", "spellchecker"),
     ("casttrophizer.workspace", "PySide6"),
     ("casttrophizer.domain", "PySide6"),
     ("casttrophizer.domain", "torch"),

@@ -195,6 +195,62 @@ def parse_ready_project(
 
 
 # --------------------------------------------------------------------------- #
+# a project ready to be corrected (parsed, planted errors)
+# --------------------------------------------------------------------------- #
+@pytest.fixture
+def correct_ready_project(
+    tmp_workspace: WorkspaceStore,
+    sample_epub: Path,
+) -> Project:
+    """A saved, parsed :class:`Project` with planted text errors for the correct stage.
+
+    ``stage_status[PARSE]=COMPLETED`` and a handful of hand-built lines carry exact, known
+    defects so correction assertions are deterministic:
+
+    * a double-space + space-before-comma line (auto-fixable whitespace);
+    * a misspelling (``narrarator``) that must surface as PENDING, text unchanged;
+    * a protected character name (``Aelin``, appears twice so the proper-noun heuristic
+      seeds it) that must yield no suggestion;
+    * a clean line that yields no suggestion.
+
+    The misspelling/known-word judgements are driven by a fake spellchecker in the tests,
+    never the real dictionary.
+    """
+    ch_id = new_id("ch")
+
+    def _line(order: int, text: str) -> Line:
+        return Line(id=new_id("line"), chapter_id=ch_id, order=order, text=text, segments=[])
+
+    lines = [
+        _line(0, "He  said , hello"),  # double space + space-before-comma -> AUTO
+        _line(1, "The narrarator spoke."),  # misspelling -> PENDING
+        _line(2, "Aelin drew her blade."),  # protected name (capitalized, recurs) -> none
+        _line(3, "Aelin smiled."),  # second Aelin so the >=2 heuristic seeds it
+        _line(4, "The quiet hall was empty."),  # clean -> none
+        _line(5, ""),  # empty/heading -> no-op
+    ]
+    chapter = Chapter(id=ch_id, order=0, title="Chapter One", lines=lines)
+
+    book = Book(
+        title="A Sample Tale",
+        author="Test Author",
+        source_ebook_path=str(sample_epub),
+        cover_image_path=None,
+        chapters=[chapter],
+    )
+    project = Project(
+        schema_version=CURRENT_SCHEMA_VERSION,
+        id=new_id("proj"),
+        name="Correct Ready",
+        workspace_dir=str(tmp_workspace.layout.root),
+        book=book,
+        stage_status={str(StageName.PARSE): ReviewStatus.COMPLETED},
+    )
+    tmp_workspace.save(project)
+    return project
+
+
+# --------------------------------------------------------------------------- #
 # fakes
 # --------------------------------------------------------------------------- #
 @pytest.fixture
