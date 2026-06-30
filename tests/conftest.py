@@ -315,6 +315,156 @@ def attribute_ready_project(
 
 
 # --------------------------------------------------------------------------- #
+# a project ready to be synthesized (attributed, voices assigned)
+# --------------------------------------------------------------------------- #
+def _seg(text: str, speaker: Speaker, role: SpeakerRole) -> Segment:
+    """An already-attributed, not-yet-synthesized segment (audio_status PENDING)."""
+    return Segment(
+        id=new_id("seg"),
+        text=text,
+        speaker_id=speaker.id,
+        role=role,
+        confidence=1.0,
+        review_status=ReviewStatus.APPROVED,
+    )
+
+
+def _build_synthesize_project(
+    workspace: WorkspaceStore,
+    sample_epub: Path,
+    voice_clips: list[Path],
+    *,
+    assign_alice_voice: bool,
+) -> Project:
+    """Build a saved, attributed project with (optionally) all voices assigned.
+
+    Two chapters of pre-segmented lines (narration + character quotes) so synthesize tests
+    have a realistic full-cast object. The narrator and Alice both get assigned voice clips
+    from ``fake_voice_clips`` unless ``assign_alice_voice`` is False (the unassigned-voice
+    precondition variant). ``stage_status`` has PARSE/CORRECT/ATTRIBUTE COMPLETED.
+    """
+    narrator_clip = VoiceClip(id=new_id("voice"), source_path=str(voice_clips[0]), label="Narrator")
+    alice_clip = VoiceClip(id=new_id("voice"), source_path=str(voice_clips[1]), label="Alice")
+
+    narrator = Speaker(
+        id=new_id("spk"),
+        name="narrator",
+        role=SpeakerRole.NARRATOR,
+        voice_clip_id=narrator_clip.id,
+    )
+    alice = Speaker(
+        id=new_id("spk"),
+        name="Alice",
+        role=SpeakerRole.CHARACTER,
+        voice_clip_id=alice_clip.id if assign_alice_voice else None,
+    )
+
+    c1 = new_id("ch")
+    c2 = new_id("ch")
+
+    def _line(ch_id: str, order: int, text: str, segments: list[Segment]) -> Line:
+        return Line(id=new_id("line"), chapter_id=ch_id, order=order, text=text, segments=segments)
+
+    ch1 = Chapter(
+        id=c1,
+        order=0,
+        title="Chapter One",
+        lines=[
+            _line(
+                c1,
+                0,
+                "The hall was silent.",
+                [_seg("The hall was silent.", narrator, SpeakerRole.NARRATOR)],
+            ),
+            _line(
+                c1,
+                1,
+                '"Hello," said Alice.',
+                [
+                    _seg('"Hello,"', alice, SpeakerRole.CHARACTER),
+                    _seg("said Alice.", narrator, SpeakerRole.NARRATOR),
+                ],
+            ),
+            _line(c1, 2, "   ", [_seg("   ", narrator, SpeakerRole.NARRATOR)]),  # whitespace-only
+        ],
+    )
+    ch2 = Chapter(
+        id=c2,
+        order=1,
+        title="Chapter Two",
+        lines=[
+            _line(
+                c2,
+                0,
+                '"We meet again," said Alice.',
+                [
+                    _seg('"We meet again,"', alice, SpeakerRole.CHARACTER),
+                    _seg("said Alice.", narrator, SpeakerRole.NARRATOR),
+                ],
+            ),
+        ],
+    )
+
+    book = Book(
+        title="A Sample Tale",
+        author="Test Author",
+        source_ebook_path=str(sample_epub),
+        cover_image_path=None,
+        chapters=[ch1, ch2],
+    )
+    project = Project(
+        schema_version=CURRENT_SCHEMA_VERSION,
+        id=new_id("proj"),
+        name="Synthesize Ready",
+        workspace_dir=str(workspace.layout.root),
+        book=book,
+        speakers=[narrator, alice],
+        voice_clips=[narrator_clip, alice_clip],
+        stage_status={
+            str(StageName.PARSE): ReviewStatus.COMPLETED,
+            str(StageName.CORRECT): ReviewStatus.COMPLETED,
+            str(StageName.ATTRIBUTE): ReviewStatus.COMPLETED,
+        },
+        tts_params={"exaggeration": 0.5, "seed": 7},
+    )
+    workspace.save(project)
+    return project
+
+
+@pytest.fixture
+def synthesize_ready_project(
+    tmp_workspace: WorkspaceStore,
+    sample_epub: Path,
+    fake_voice_clips: list[Path],
+) -> Project:
+    """A saved, fully-attributed project with every referenced speaker's voice assigned.
+
+    Two chapters of narration + Alice quotes (plus one whitespace-only segment), all speakers
+    pointing at existing ``fake_voice_clips``, ``tts_params`` set, and all attribution/correct
+    stages COMPLETED — the exact state the synthesize stage expects.
+    """
+    return _build_synthesize_project(
+        tmp_workspace, sample_epub, fake_voice_clips, assign_alice_voice=True
+    )
+
+
+@pytest.fixture
+def synthesize_unassigned_voice_project(
+    tmp_workspace: WorkspaceStore,
+    sample_epub: Path,
+    fake_voice_clips: list[Path],
+) -> Project:
+    """Same as ``synthesize_ready_project`` but Alice has no assigned voice clip.
+
+    Exercises the §2b fail-fast precheck: the stage must FAIL naming the unresolved speaker
+    before any TTS call.
+    """
+    return _build_synthesize_project(
+        tmp_workspace, sample_epub, fake_voice_clips, assign_alice_voice=False
+    )
+
+
+# --------------------------------------------------------------------------- #
 # fakes
 # --------------------------------------------------------------------------- #
 @pytest.fixture

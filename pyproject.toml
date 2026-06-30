@@ -56,9 +56,12 @@ python_version = "3.11"
 strict = true
 files = ["src"]
 
-# Third-party EPUB/HTML libs ship no type stubs; allow importing them untyped.
+# Third-party libs (EPUB/HTML, spellcheck, TTS/torch) ship no type stubs; import untyped.
 [[tool.mypy.overrides]]
-module = ["ebooklib", "ebooklib.*", "bs4", "bs4.*", "spellchecker", "spellchecker.*"]
+module = [
+    "ebooklib", "ebooklib.*", "bs4", "bs4.*", "spellchecker", "spellchecker.*",
+    "chatterbox", "chatterbox.*", "torch", "torch.*", "torchaudio", "torchaudio.*",
+]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

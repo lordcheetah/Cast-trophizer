@@ -39,6 +39,13 @@ _LAZY_IMPORT_CASES: list[tuple[str, str]] = [
     # The TTS provider must not import torch/chatterbox at module load.
     ("casttrophizer.providers.tts.chatterbox", "torch"),
     ("casttrophizer.providers.tts.chatterbox", "chatterbox"),
+    ("casttrophizer.providers.tts.chatterbox", "torchaudio"),
+    # The synthesize orchestration + stage drive ``ctx.tts`` lazily — importing them must
+    # not drag in torch/chatterbox (the heavy TTS deps load only when a real provider runs).
+    ("casttrophizer.audio.synthesize", "torch"),
+    ("casttrophizer.audio.synthesize", "chatterbox"),
+    ("casttrophizer.pipeline.stages.synthesize", "torch"),
+    ("casttrophizer.pipeline.stages.synthesize", "chatterbox"),
     # The factory package re-exports ABCs only — no concrete SDK should appear.
     ("casttrophizer.providers", "anthropic"),
     ("casttrophizer.providers", "openai"),
