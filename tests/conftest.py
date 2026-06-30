@@ -315,6 +315,151 @@ def attribute_ready_project(
 
 
 # --------------------------------------------------------------------------- #
+# a project ready for review (attributed; mixed blocker state)
+# --------------------------------------------------------------------------- #
+@pytest.fixture
+def review_ready_project(
+    tmp_workspace: WorkspaceStore,
+    sample_epub: Path,
+    fake_voice_clips: list[Path],
+) -> Project:
+    """A saved, attributed :class:`Project` carrying mixed review-blocker state.
+
+    ``stage_status[PARSE/CORRECT/ATTRIBUTE]=COMPLETED``. It deliberately carries one of
+    each blocker plus already-resolved items so the gate's "resolved doesn't block" path
+    is also exercised:
+
+    * an APPROVED narrator segment + a NEEDS_REVIEW Bob segment (attribution blocker);
+    * a line with an AUTO_APPLIED suggestion (resolved) and a PENDING suggestion (blocker);
+    * the narrator + Alice have assigned, existing voice clips; **Bob has none** (voice
+      blocker — and Bob is referenced by a renderable segment).
+
+    Clearing all three (approve Bob's segment, resolve the pending suggestion, assign Bob a
+    voice) makes ``review_blockers`` empty.
+    """
+    narrator_clip = VoiceClip(
+        id=new_id("voice"), source_path=str(fake_voice_clips[0]), label="Narrator"
+    )
+    alice_clip = VoiceClip(id=new_id("voice"), source_path=str(fake_voice_clips[1]), label="Alice")
+
+    narrator = Speaker(
+        id=new_id("spk"),
+        name="narrator",
+        role=SpeakerRole.NARRATOR,
+        voice_clip_id=narrator_clip.id,
+    )
+    alice = Speaker(
+        id=new_id("spk"),
+        name="Alice",
+        role=SpeakerRole.CHARACTER,
+        voice_clip_id=alice_clip.id,
+    )
+    bob = Speaker(
+        id=new_id("spk"),
+        name="Bob",
+        role=SpeakerRole.CHARACTER,
+        voice_clip_id=None,  # voice blocker
+    )
+
+    ch_id = new_id("ch")
+
+    line0 = Line(
+        id=new_id("line"),
+        chapter_id=ch_id,
+        order=0,
+        text='"Hello," said Alice.',
+        segments=[
+            Segment(
+                id=new_id("seg"),
+                text='"Hello,"',
+                speaker_id=alice.id,
+                role=SpeakerRole.CHARACTER,
+                confidence=0.95,
+                review_status=ReviewStatus.APPROVED,
+            ),
+            Segment(
+                id=new_id("seg"),
+                text="said Alice.",
+                speaker_id=narrator.id,
+                role=SpeakerRole.NARRATOR,
+                confidence=0.99,
+                review_status=ReviewStatus.APPROVED,
+            ),
+        ],
+        suggestions=[
+            TextSuggestion(
+                id=new_id("sug"),
+                original="Allice",
+                suggested="Alice",
+                reason="spellcheck",
+                confidence=0.97,
+                status=ReviewStatus.AUTO_APPLIED,  # resolved -> does not block
+            )
+        ],
+    )
+    line1 = Line(
+        id=new_id("line"),
+        chapter_id=ch_id,
+        order=1,
+        text='"Hi," Bob replied.',
+        segments=[
+            Segment(
+                id=new_id("seg"),
+                text='"Hi,"',
+                speaker_id=bob.id,
+                role=SpeakerRole.CHARACTER,
+                confidence=0.4,
+                review_status=ReviewStatus.NEEDS_REVIEW,  # attribution blocker
+            ),
+            Segment(
+                id=new_id("seg"),
+                text="Bob replied.",
+                speaker_id=narrator.id,
+                role=SpeakerRole.NARRATOR,
+                confidence=0.99,
+                review_status=ReviewStatus.APPROVED,
+            ),
+        ],
+        suggestions=[
+            TextSuggestion(
+                id=new_id("sug"),
+                original="Bbo",
+                suggested="Bob",
+                reason="spellcheck",
+                confidence=0.6,
+                status=ReviewStatus.PENDING,  # suggestion blocker
+            )
+        ],
+    )
+    chapter = Chapter(id=ch_id, order=0, title="Chapter One", lines=[line0, line1])
+
+    book = Book(
+        title="A Sample Tale",
+        author="Test Author",
+        source_ebook_path=str(sample_epub),
+        cover_image_path=None,
+        chapters=[chapter],
+    )
+    project = Project(
+        schema_version=CURRENT_SCHEMA_VERSION,
+        id=new_id("proj"),
+        name="Review Ready",
+        workspace_dir=str(tmp_workspace.layout.root),
+        book=book,
+        speakers=[narrator, alice, bob],
+        voice_clips=[narrator_clip, alice_clip],
+        stage_status={
+            str(StageName.PARSE): ReviewStatus.COMPLETED,
+            str(StageName.CORRECT): ReviewStatus.COMPLETED,
+            str(StageName.ATTRIBUTE): ReviewStatus.COMPLETED,
+        },
+        tts_params={"exaggeration": 0.5, "seed": 7},
+    )
+    tmp_workspace.save(project)
+    return project
+
+
+# --------------------------------------------------------------------------- #
 # a project ready to be synthesized (attributed, voices assigned)
 # --------------------------------------------------------------------------- #
 def _seg(text: str, speaker: Speaker, role: SpeakerRole) -> Segment:

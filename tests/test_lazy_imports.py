@@ -72,6 +72,16 @@ _LAZY_IMPORT_CASES: list[tuple[str, str]] = [
     ("casttrophizer.workspace", "PySide6"),
     ("casttrophizer.domain", "PySide6"),
     ("casttrophizer.domain", "torch"),
+    # The headless review package (gate/actions/service) + the review stage stay Qt-free
+    # and SDK-free: they are the operation layer the future PySide6 review UI calls, never
+    # the UI itself, and they never touch a real provider.
+    ("casttrophizer.review", "PySide6"),
+    ("casttrophizer.review", "anthropic"),
+    ("casttrophizer.review", "torch"),
+    ("casttrophizer.review", "chatterbox"),
+    ("casttrophizer.pipeline.stages.review", "PySide6"),
+    ("casttrophizer.pipeline.stages.review", "torch"),
+    ("casttrophizer.pipeline.stages.review", "chatterbox"),
 ]
 
 
