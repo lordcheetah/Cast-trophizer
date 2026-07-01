@@ -65,6 +65,8 @@ module = [
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]
-pythonpath = ["src"]
+# "src" makes the package importable; "." puts the repo root on sys.path so conftest's
+# `from tests.data...` imports work under the bare `pytest` entrypoint (not just `python -m pytest`).
+pythonpath = ["src", "."]
 testpaths = ["tests"]
 addopts = "-q"
