@@ -23,6 +23,7 @@ from casttrophizer.domain.models import (
     VoiceClip,
 )
 from casttrophizer.domain.serialization import CURRENT_SCHEMA_VERSION
+from casttrophizer.workspace.audio_cache import AudioCache
 from casttrophizer.workspace.layout import WorkspaceLayout
 from casttrophizer.workspace.store import WorkspaceStore
 from tests.data.make_sample_epub import make_sample_epub
@@ -606,6 +607,243 @@ def synthesize_unassigned_voice_project(
     """
     return _build_synthesize_project(
         tmp_workspace, sample_epub, fake_voice_clips, assign_alice_voice=False
+    )
+
+
+# --------------------------------------------------------------------------- #
+# a project ready to be assembled (synthesized: every renderable segment has a WAV)
+# --------------------------------------------------------------------------- #
+def _plant_segment_audio(
+    project: Project,
+    cache: AudioCache,
+    *,
+    durations: dict[str, float],
+) -> None:
+    """Simulate a completed synthesize: for each renderable segment compute its cache key,
+    write a real silent WAV of a known duration at ``cache.path_for_key(key)``, and stamp
+    ``audio_cache_key`` + ``audio_status=COMPLETED``. ``durations`` maps segment text ->
+    seconds so timing assertions are exact. Whitespace-only segments are left untouched
+    (no key, PENDING) to prove they are skipped.
+    """
+    for chapter in project.book.chapters:
+        for line in chapter.lines:
+            for segment in line.segments:
+                if not segment.text.strip():
+                    continue
+                key = AudioCache.key_for(segment, project)
+                _write_silent_wav(cache.path_for_key(key), seconds=durations[segment.text])
+                segment.audio_cache_key = key
+                segment.audio_status = ReviewStatus.COMPLETED
+
+
+def _build_assemble_project(
+    workspace: WorkspaceStore,
+    sample_epub: Path,
+    voice_clips: list[Path],
+    *,
+    cover_path: str | None = None,
+) -> Project:
+    """A saved, fully-synthesized project ready for assemble.
+
+    Three chapters: two with renderable content (narration + Alice quotes, plus a
+    whitespace-only segment that must be skipped) and one empty chapter (zero renderable
+    segments -> a zero-length marker). Segment texts are distinct so each renderable segment
+    gets its own known duration for exact chapter-timing assertions.
+    """
+    narrator_clip = VoiceClip(id=new_id("voice"), source_path=str(voice_clips[0]), label="Narrator")
+    alice_clip = VoiceClip(id=new_id("voice"), source_path=str(voice_clips[1]), label="Alice")
+
+    narrator = Speaker(
+        id=new_id("spk"),
+        name="narrator",
+        role=SpeakerRole.NARRATOR,
+        voice_clip_id=narrator_clip.id,
+    )
+    alice = Speaker(
+        id=new_id("spk"),
+        name="Alice",
+        role=SpeakerRole.CHARACTER,
+        voice_clip_id=alice_clip.id,
+    )
+
+    def _seg2(text: str, speaker: Speaker, role: SpeakerRole) -> Segment:
+        return Segment(
+            id=new_id("seg"),
+            text=text,
+            speaker_id=speaker.id,
+            role=role,
+            confidence=1.0,
+            review_status=ReviewStatus.APPROVED,
+        )
+
+    def _line(ch_id: str, order: int, text: str, segments: list[Segment]) -> Line:
+        return Line(id=new_id("line"), chapter_id=ch_id, order=order, text=text, segments=segments)
+
+    c1 = new_id("ch")
+    c2 = new_id("ch")
+    c3 = new_id("ch")
+
+    ch1 = Chapter(
+        id=c1,
+        order=0,
+        title="Chapter One",
+        lines=[
+            _line(
+                c1,
+                0,
+                "The hall was silent.",
+                [_seg2("The hall was silent.", narrator, SpeakerRole.NARRATOR)],
+            ),
+            _line(
+                c1,
+                1,
+                '"Hello," said Alice.',
+                [
+                    _seg2('"Hello,"', alice, SpeakerRole.CHARACTER),
+                    _seg2("said Alice softly.", narrator, SpeakerRole.NARRATOR),
+                ],
+            ),
+            _line(
+                c1,
+                2,
+                "   ",
+                [_seg2("   ", narrator, SpeakerRole.NARRATOR)],
+            ),  # whitespace-only -> skipped
+        ],
+    )
+    ch2 = Chapter(
+        id=c2,
+        order=1,
+        title="Chapter Two",
+        lines=[
+            _line(
+                c2,
+                0,
+                '"We meet again," said Alice.',
+                [
+                    _seg2('"We meet again,"', alice, SpeakerRole.CHARACTER),
+                    _seg2("said Alice again.", narrator, SpeakerRole.NARRATOR),
+                ],
+            ),
+        ],
+    )
+    ch3 = Chapter(id=c3, order=2, title="Chapter Three (empty)", lines=[])
+
+    book = Book(
+        title="A Sample Tale",
+        author="Test Author",
+        source_ebook_path=str(sample_epub),
+        cover_image_path=cover_path,
+        chapters=[ch1, ch2, ch3],
+    )
+    project = Project(
+        schema_version=CURRENT_SCHEMA_VERSION,
+        id=new_id("proj"),
+        name="Assemble Ready",
+        workspace_dir=str(workspace.layout.root),
+        book=book,
+        speakers=[narrator, alice],
+        voice_clips=[narrator_clip, alice_clip],
+        stage_status={
+            str(StageName.PARSE): ReviewStatus.COMPLETED,
+            str(StageName.CORRECT): ReviewStatus.COMPLETED,
+            str(StageName.ATTRIBUTE): ReviewStatus.COMPLETED,
+            str(StageName.REVIEW): ReviewStatus.COMPLETED,
+            str(StageName.SYNTHESIZE): ReviewStatus.COMPLETED,
+        },
+        tts_params={"exaggeration": 0.5, "seed": 7},
+    )
+
+    _plant_segment_audio(
+        project, AudioCache(workspace.layout), durations=ASSEMBLE_SEGMENT_DURATIONS
+    )
+    workspace.save(project)
+    return project
+
+
+#: The known per-segment WAV durations planted by ``_build_assemble_project`` (seconds), keyed
+#: by segment text. Tests import this to compute expected chapter start/end times exactly.
+ASSEMBLE_SEGMENT_DURATIONS: dict[str, float] = {
+    "The hall was silent.": 0.20,
+    '"Hello,"': 0.10,
+    "said Alice softly.": 0.30,
+    '"We meet again,"': 0.15,
+    "said Alice again.": 0.25,
+}
+
+
+@pytest.fixture
+def assemble_ready_project(
+    tmp_workspace: WorkspaceStore,
+    sample_epub: Path,
+    fake_voice_clips: list[Path],
+) -> Project:
+    """A saved, fully-synthesized project: every renderable segment has an on-disk WAV.
+
+    Three chapters (two with content + a whitespace-only segment, one empty), all upstream
+    stages COMPLETED, and each renderable segment stamped ``audio_cache_key`` + COMPLETED with
+    a real silent WAV of a known duration in the audio cache — the exact state assemble expects.
+    """
+    return _build_assemble_project(tmp_workspace, sample_epub, fake_voice_clips)
+
+
+@pytest.fixture
+def assemble_unrendered_project(
+    tmp_workspace: WorkspaceStore,
+    sample_epub: Path,
+    fake_voice_clips: list[Path],
+) -> Project:
+    """Same as ``assemble_ready_project`` but one renderable segment is unrendered.
+
+    Its ``audio_cache_key`` is cleared and ``audio_status`` reset to PENDING (and its WAV
+    removed), exercising the fail-fast precheck: assemble must FAIL naming the unrendered
+    segment before any ffmpeg work.
+    """
+    project = _build_assemble_project(tmp_workspace, sample_epub, fake_voice_clips)
+    cache = AudioCache(tmp_workspace.layout)
+    target = next(
+        seg
+        for ch in project.book.chapters
+        for ln in ch.lines
+        for seg in ln.segments
+        if seg.text == "The hall was silent."
+    )
+    assert target.audio_cache_key is not None
+    cache.path_for_key(target.audio_cache_key).unlink()
+    target.audio_cache_key = None
+    target.audio_status = ReviewStatus.PENDING
+    tmp_workspace.save(project)
+    return project
+
+
+@pytest.fixture
+def sample_cover_image(tmp_path: Path) -> Path:
+    """A tiny valid PNG standing in for a read-only cover input."""
+    # A 1x1 transparent PNG (67 bytes) — enough for mutagen/format-detection tests.
+    png_bytes = bytes.fromhex(
+        "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4"
+        "890000000d49444154789c63000100000500010d0a2db40000000049454e44ae426082"
+    )
+    path = tmp_path / "inputs" / "cover.png"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(png_bytes)
+    return path
+
+
+@pytest.fixture
+def assemble_with_cover_project(
+    tmp_workspace: WorkspaceStore,
+    sample_epub: Path,
+    fake_voice_clips: list[Path],
+    sample_cover_image: Path,
+) -> Project:
+    """Same as ``assemble_ready_project`` but ``book.cover_image_path`` points at a real PNG.
+
+    Exercises the embed-if-set cover path (the cover file is a read-only input, referenced but
+    never copied into the workspace).
+    """
+    return _build_assemble_project(
+        tmp_workspace, sample_epub, fake_voice_clips, cover_path=str(sample_cover_image)
     )
 
 

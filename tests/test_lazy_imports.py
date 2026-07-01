@@ -82,6 +82,15 @@ _LAZY_IMPORT_CASES: list[tuple[str, str]] = [
     ("casttrophizer.pipeline.stages.review", "PySide6"),
     ("casttrophizer.pipeline.stages.review", "torch"),
     ("casttrophizer.pipeline.stages.review", "chatterbox"),
+    # The assemble orchestration + assembler + stage import ffmpeg/mutagen only lazily inside
+    # the real assemble() call — importing the modules must pull in no mutagen/Qt/torch.
+    ("casttrophizer.audio.assembler", "mutagen"),
+    ("casttrophizer.audio.assembler", "PySide6"),
+    ("casttrophizer.audio.assemble", "mutagen"),
+    ("casttrophizer.audio.assemble", "PySide6"),
+    ("casttrophizer.pipeline.stages.assemble", "mutagen"),
+    ("casttrophizer.pipeline.stages.assemble", "PySide6"),
+    ("casttrophizer.pipeline.stages.assemble", "torch"),
 ]
 
 
