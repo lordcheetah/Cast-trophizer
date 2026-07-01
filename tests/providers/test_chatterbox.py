@@ -262,7 +262,18 @@ def test_device_auto_falls_back_to_cpu(tmp_path: Path, monkeypatch: pytest.Monke
 # --------------------------------------------------------------------------- #
 # is_available: spec-based, no model/torch load
 # --------------------------------------------------------------------------- #
-def test_is_available_false_when_chatterbox_absent() -> None:
-    # torch/chatterbox are not installed in CI, so find_spec returns None -> unavailable.
-    # (No fake modules injected here: this is the real environment check.)
+def test_is_available_false_when_deps_absent(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Force the "not installed" case regardless of whether the `tts` extra is present in
+    # this environment, so the test is hermetic (CI has no torch/chatterbox; a dev machine
+    # with the `tts` extra does). is_available() imports find_spec from importlib.util lazily.
+    import importlib.util
+
+    monkeypatch.setattr(importlib.util, "find_spec", lambda *a, **k: None)
     assert ChatterboxProvider().is_available() is False
+
+
+def test_is_available_true_when_deps_present(monkeypatch: pytest.MonkeyPatch) -> None:
+    import importlib.util
+
+    monkeypatch.setattr(importlib.util, "find_spec", lambda *a, **k: object())
+    assert ChatterboxProvider().is_available() is True
