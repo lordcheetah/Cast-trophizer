@@ -124,6 +124,20 @@ class ReviewService:
         actions.assign_voice(speaker, voice_clip)
         self._save()
 
+    def assign_voices(self, pairs: list[tuple[Speaker, VoiceClip]]) -> None:
+        """Assign many ``(speaker, clip)`` pairs in memory, then persist **once**.
+
+        The batch analogue of :meth:`assign_voice` for ``castrun assign-voice --rest`` —
+        a large cast shouldn't fsync per speaker (mirrors the CLI auto-accept single-write
+        pattern). Any ``VoiceClip`` already registered on ``self.project`` (e.g. via
+        ``actions.register_voice_clip``) is persisted by the same single save. Assigning a
+        voice only *clears* the criterion-3 blocker, so — like :meth:`assign_voice` — no
+        review-flag invalidation is needed.
+        """
+        for speaker, voice_clip in pairs:
+            actions.assign_voice(speaker, voice_clip)
+        self._save()
+
     def assign_voice_by_ids(self, *, speaker_id: str, voice_clip_id: str) -> None:
         """Assign a voice by ids (clears a criterion-3 blocker) and persist."""
         actions.assign_voice_by_ids(

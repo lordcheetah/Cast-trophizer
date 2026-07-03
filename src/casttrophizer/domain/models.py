@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from casttrophizer.domain.enums import ReviewStatus, SpeakerRole
+from casttrophizer.domain.enums import ReviewStatus, SpeakerRole, VoiceCategory
 from casttrophizer.domain.ids import (
     ChapterId,
     LineId,
@@ -99,13 +99,17 @@ class Speaker:
     """A voice in the cast — the narrator or a named character.
 
     ``voice_clip_id`` is the user-assigned mapping to a :class:`VoiceClip`; ``None``
-    until the user assigns one.
+    until the user assigns one. ``category`` is the voice bucket stamped by the
+    post-attribution classification pass (``UNKNOWN`` for the narrator, or when
+    classification is unavailable/uncertain); it drives ``assign-voice --rest`` default-clip
+    selection but never gates synthesis.
     """
 
     id: SpeakerId
     name: str  # "narrator" reserved; characters by display name
     role: SpeakerRole
     voice_clip_id: VoiceClipId | None = None
+    category: VoiceCategory = VoiceCategory.UNKNOWN
 
 
 @dataclass

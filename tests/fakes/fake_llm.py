@@ -13,6 +13,11 @@ an unrequested id (tests the defensive drop), ``raise_malformed=True`` to raise
 ``LLMProviderError(malformed=True)`` (tests retry-then-soft-flag), and ``raise_unreachable``
 to raise a plain ``LLMProviderError`` (tests the FAILED path). ``attribute_calls`` records
 every call so tests can assert call counts (idempotency / batching).
+
+Voice-category classification is scripted separately via ``classify_script`` (keyed by
+speaker *name* -> ``(category, confidence)``, default ``unknown``); ``raise_classify_malformed``
+/ ``raise_classify_unreachable`` exercise the soft-fail path, and ``classify_calls`` records
+each classification pass.
 """
 
 from __future__ import annotations
@@ -20,7 +25,13 @@ from __future__ import annotations
 import re
 
 from casttrophizer.errors import LLMProviderError
-from casttrophizer.providers.base import AttributionCandidate, LLMMessage, LLMProvider
+from casttrophizer.providers.base import (
+    AttributionCandidate,
+    LLMMessage,
+    LLMProvider,
+    SpeakerClassification,
+    SpeakerProfile,
+)
 
 __all__ = ["FakeLLMProvider"]
 
@@ -46,6 +57,9 @@ class FakeLLMProvider(LLMProvider):
         extra_ids: list[str] | None = None,
         raise_malformed: bool = False,
         raise_unreachable: bool = False,
+        classify_script: dict[str, tuple[str, float]] | None = None,
+        raise_classify_malformed: bool = False,
+        raise_classify_unreachable: bool = False,
     ) -> None:
         self._completion = completion
         self._default_confidence = default_confidence
@@ -56,8 +70,12 @@ class FakeLLMProvider(LLMProvider):
         self._extra_ids = extra_ids or []
         self._raise_malformed = raise_malformed
         self._raise_unreachable = raise_unreachable
+        self._classify_script = classify_script or {}
+        self._raise_classify_malformed = raise_classify_malformed
+        self._raise_classify_unreachable = raise_classify_unreachable
         self.complete_calls: list[list[LLMMessage]] = []
         self.attribute_calls: list[tuple[str, list[str], list[str]]] = []
+        self.classify_calls: list[list[SpeakerProfile]] = []
 
     def complete(
         self,
@@ -112,6 +130,36 @@ class FakeLLMProvider(LLMProvider):
             results.append(
                 AttributionCandidate(
                     segment_id=extra, speaker_name="Ghost", confidence=0.9, rationale="extra"
+                )
+            )
+        return results
+
+    def classify_speakers(self, *, speakers: list[SpeakerProfile]) -> list[SpeakerClassification]:
+        """Return scripted categories keyed by speaker name (default ``unknown``).
+
+        ``classify_script`` maps a speaker's display name -> ``(category, confidence)``. A
+        name not in the script classifies ``unknown`` at 0.0. ``raise_classify_unreachable``
+        raises a plain ``LLMProviderError`` (reachability); ``raise_classify_malformed``
+        raises ``LLMProviderError(malformed=True)`` — both exercise the soft-fail path (the
+        orchestration leaves categories ``unknown`` and never fails the stage). ``classify_calls``
+        records every call so tests can assert exactly one classification pass per finished run.
+        """
+        self.classify_calls.append(list(speakers))
+
+        if self._raise_classify_unreachable:
+            raise LLMProviderError("fake classifier unreachable")
+        if self._raise_classify_malformed:
+            raise LLMProviderError("fake malformed classification output", malformed=True)
+
+        results: list[SpeakerClassification] = []
+        for profile in speakers:
+            category, confidence = self._classify_script.get(profile.name, ("unknown", 0.0))
+            results.append(
+                SpeakerClassification(
+                    speaker_id=profile.speaker_id,
+                    category=category,
+                    confidence=confidence,
+                    rationale="scripted",
                 )
             )
         return results

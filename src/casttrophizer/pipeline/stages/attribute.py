@@ -7,6 +7,13 @@ attributions are flagged ``NEEDS_REVIEW`` and never silently committed. Discover
 names are registered in ``project.speakers``. Narration is the narrator by construction and
 is never sent to the LLM.
 
+On the pass that *finishes* attribution — after the chapter loop, immediately before
+stamping ``stage_status[ATTRIBUTE]=COMPLETED`` — a one-shot classification pass buckets every
+discovered CHARACTER speaker into a ``VoiceCategory`` via one ``ctx.llm.classify_speakers``
+call (the narrator stays ``UNKNOWN``). That pass is soft: any provider error leaves categories
+``unknown`` and never fails the (already-successful) attribution. It runs only on the finishing
+pass, so a resumed / already-COMPLETED project is never reclassified.
+
 Resume/idempotency: the idempotency key is ``Line.segments`` — a line that already has
 segments is skipped (mirrors ``correct``'s skip-on-existing rule), so a re-run creates no
 duplicate segments and makes no extra LLM calls. The stop checkpoint is per chapter, with a
@@ -26,6 +33,7 @@ from casttrophizer.attribution import (
     ATTRIBUTION_CONFIDENCE_THRESHOLD,
     Segmenter,
     attribute_chapter,
+    classify_speakers,
     default_segmenter,
     ensure_narrator,
 )
@@ -97,6 +105,13 @@ class SegmentAttributeStage(Stage):
         except LLMProviderError as exc:
             ctx.store.save(project)  # keep partial progress; re-runnable once provider is back
             return StageResult(self.name, ReviewStatus.FAILED, str(exc))
+
+        # Finishing pass: one-shot classify discovered CHARACTER speakers into voice
+        # categories, right before stamping COMPLETED. Soft — the orchestration swallows any
+        # provider error and leaves categories `unknown`, so classification never fails an
+        # otherwise-successful attribution. Runs only on this finishing pass, so a resumed
+        # (already-COMPLETED) project is not reclassified.
+        classify_speakers(project, ctx.llm)
 
         project.stage_status[str(StageName.ATTRIBUTE)] = ReviewStatus.COMPLETED
         ctx.store.save(project)

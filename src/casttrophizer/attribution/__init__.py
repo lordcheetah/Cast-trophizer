@@ -13,6 +13,10 @@ from casttrophizer.attribution.attribute import (
     attribute_chapter,
     build_context,
 )
+from casttrophizer.attribution.classify import (
+    CLASSIFY_SAMPLE_LINES,
+    classify_speakers,
+)
 from casttrophizer.attribution.policy import (
     ATTRIBUTION_CONFIDENCE_THRESHOLD,
     ensure_narrator,
@@ -36,6 +40,8 @@ __all__ = [
     "MAX_LINES_PER_BATCH",
     "attribute_chapter",
     "build_context",
+    "CLASSIFY_SAMPLE_LINES",
+    "classify_speakers",
     "default_segmenter",
 ]
 

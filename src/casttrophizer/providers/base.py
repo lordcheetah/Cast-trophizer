@@ -21,6 +21,8 @@ __all__ = [
     "AttributionCandidate",
     "LLMMessage",
     "LLMProvider",
+    "SpeakerProfile",
+    "SpeakerClassification",
     "SynthesisRequest",
     "SynthesisResult",
     "TTSProvider",
@@ -41,6 +43,34 @@ class AttributionCandidate:
     segment_id: str
     speaker_name: str | None  # None => narrator
     confidence: float  # 0.0-1.0
+    rationale: str = ""
+
+
+@dataclass
+class SpeakerProfile:
+    """One speaker to classify into a voice category, with a little dialogue context.
+
+    ``samples`` are a few of the character's own dialogue lines — enough for the model to
+    bucket gender/age from name + voice. The narrator is never sent (always ``unknown``).
+    """
+
+    speaker_id: str
+    name: str
+    samples: list[str] = field(default_factory=list)
+
+
+@dataclass
+class SpeakerClassification:
+    """A proposed voice category for one speaker.
+
+    ``category`` is a free string on this cross-provider boundary (the domain enum stays out
+    of ``providers/``); the caller maps it via ``VoiceCategory.coerce``. Low ``confidence`` is
+    informational — v1 does not surface it as a review blocker.
+    """
+
+    speaker_id: str
+    category: str  # free string; caller maps via VoiceCategory.coerce
+    confidence: float = 0.0
     rationale: str = ""
 
 
@@ -80,6 +110,21 @@ class LLMProvider(ABC):
         ``context`` is the surrounding text; ``known_speakers`` are display names already
         established. The LLM proposes; low-confidence results are surfaced for review.
         """
+
+    def classify_speakers(self, *, speakers: list[SpeakerProfile]) -> list[SpeakerClassification]:
+        """Bucket each speaker into a voice category (man/woman/boy/girl/unknown).
+
+        The default implementation classifies everyone ``unknown`` — a safe no-op so a
+        provider without a real classifier (e.g. LM Studio v1) degrades to ``--default``
+        rather than failing, and the ABC change stays non-breaking for existing providers
+        and test doubles. Concrete providers (Claude) override this with a real one-shot
+        call. This pass is non-critical: raising is allowed (the orchestration catches
+        :class:`~casttrophizer.errors.LLMProviderError` and leaves categories ``unknown``),
+        but the default simply returns ``unknown`` for every requested speaker.
+        """
+        return [
+            SpeakerClassification(speaker_id=s.speaker_id, category="unknown") for s in speakers
+        ]
 
     @abstractmethod
     def is_available(self) -> bool:

@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from casttrophizer.domain.enums import ReviewStatus, SpeakerRole
+from casttrophizer.domain.enums import ReviewStatus, SpeakerRole, VoiceCategory
 from casttrophizer.domain.models import (
     Book,
     Chapter,
@@ -33,7 +33,11 @@ __all__ = ["CURRENT_SCHEMA_VERSION", "project_to_dict", "project_from_dict"]
 
 #: Current on-disk schema version. Bump when the persisted shape changes and add a
 #: migration step in :func:`_migrate`.
-CURRENT_SCHEMA_VERSION = 1
+#:
+#: History:
+#:   v1 -> v2: added ``Speaker.category`` (:class:`VoiceCategory`); pre-v2 speakers with no
+#:             ``category`` key default to ``unknown`` (see :func:`_migrate_v1_to_v2`).
+CURRENT_SCHEMA_VERSION = 2
 
 
 # --------------------------------------------------------------------------- #
@@ -89,6 +93,7 @@ def _speaker_to_dict(sp: Speaker) -> dict[str, Any]:
         "name": sp.name,
         "role": str(sp.role),
         "voice_clip_id": sp.voice_clip_id,
+        "category": str(sp.category),
     }
 
 
@@ -174,6 +179,7 @@ def _speaker_from_dict(d: dict[str, Any]) -> Speaker:
         name=d["name"],
         role=SpeakerRole(d["role"]),
         voice_clip_id=d["voice_clip_id"],
+        category=VoiceCategory(d["category"]),  # present post-migration (v1->v2 defaults it)
     )
 
 
@@ -227,18 +233,36 @@ def project_from_dict(data: dict[str, Any]) -> Project:
 def _migrate(data: dict[str, Any], version: int) -> dict[str, Any]:
     """Migrate ``data`` from its stored ``version`` up to :data:`CURRENT_SCHEMA_VERSION`.
 
-    Each future bump adds a step here that transforms ``version -> version + 1``. With
-    only one schema version today there is nothing to do; an unknown/future version is
-    a hard error rather than a silent best-effort load.
+    A version-step chain: each bump adds a step that transforms ``version -> version + 1``.
+    A future/unknown version, or a version with no path to the current one, is a hard error
+    rather than a silent best-effort load.
     """
-    if version == CURRENT_SCHEMA_VERSION:
-        return data
     if version > CURRENT_SCHEMA_VERSION:
         raise MigrationError(
             f"project schema_version {version} is newer than supported "
             f"{CURRENT_SCHEMA_VERSION}; upgrade Cast-trophizer to open this workspace"
         )
-    # version < CURRENT_SCHEMA_VERSION: no historical migrations exist yet.
-    raise MigrationError(
-        f"no migration path from schema_version {version} to {CURRENT_SCHEMA_VERSION}"
-    )
+    if version < 1:
+        raise MigrationError(
+            f"no migration path from schema_version {version} to {CURRENT_SCHEMA_VERSION}"
+        )
+    if version == 1:
+        data = _migrate_v1_to_v2(data)
+        version = 2
+    # future: if version == 2: data = _migrate_v2_to_v3(data); version = 3
+    if version != CURRENT_SCHEMA_VERSION:
+        raise MigrationError(
+            f"no migration path from schema_version {version} to {CURRENT_SCHEMA_VERSION}"
+        )
+    return data
+
+
+def _migrate_v1_to_v2(data: dict[str, Any]) -> dict[str, Any]:
+    """v1 -> v2: stamp every speaker with ``category=unknown`` (the field's new default).
+
+    Pre-feature projects had no ``category`` key; ``unknown`` is covered by ``--default``
+    under ``assign-voice --rest``, so a migrated project can be fully voiced immediately.
+    """
+    for speaker in data.get("speakers", []):
+        speaker.setdefault("category", str(VoiceCategory.UNKNOWN))
+    return data

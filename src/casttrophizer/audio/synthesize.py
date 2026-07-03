@@ -40,6 +40,7 @@ __all__ = [
     "STOP_POLL_INTERVAL",
     "RENDERED_STATUSES",
     "unresolved_voices",
+    "unresolved_speakers",
     "synthesize_chapter",
 ]
 
@@ -125,6 +126,34 @@ def unresolved_voices(project: Project) -> list[str]:
         missing.setdefault("<unattributed>", None)
 
     return list(missing)
+
+
+def unresolved_speakers(project: Project) -> list[Speaker]:
+    """Return the referenced, currently-unvoiced :class:`Speaker` objects (§2b, object form).
+
+    The Speaker-object analogue of :func:`unresolved_voices`: a speaker is included iff it is
+    referenced by some renderable segment (so ``castrun assign-voice --rest`` targets exactly
+    the speakers the review gate flags) and lacks a usable voice clip (per
+    :func:`_resolved_clip_path`). Shares ``_referenced_speaker_ids`` + ``_resolved_clip_path``
+    with :func:`unresolved_voices` so the two predicates cannot drift. First-referenced order,
+    de-duplicated.
+
+    Unlike :func:`unresolved_voices`, this **excludes** the ``<unattributed>`` sentinel (a
+    renderable segment with ``speaker_id`` ``None`` has no Speaker to voice — ``--rest`` cannot
+    fix it) and any referenced id that resolves to no Speaker object.
+    """
+    speakers = _speaker_index(project)
+    voices = _voice_index(project)
+    out: list[Speaker] = []
+    seen: set[str] = set()
+    for speaker_id in _referenced_speaker_ids(project):
+        speaker = speakers.get(speaker_id)
+        if speaker is None or speaker.id in seen:
+            continue
+        if _resolved_clip_path(speaker, voices) is None:
+            out.append(speaker)
+            seen.add(speaker.id)
+    return out
 
 
 def _has_unattributed_renderable_segment(project: Project) -> bool:

@@ -16,6 +16,8 @@ Command surface::
     status
     speakers
     assign-voice  SPEAKER CLIP        # SPEAKER = list index (int) or name (case-insensitive)
+    assign-voice  --rest [--man P] [--woman P] [--boy P] [--girl P] [--default P]
+                                      # bulk-voice every still-unvoiced speaker by category
 
 Import discipline: this module is Qt-free and import-cheap. It never imports ``PySide6``,
 ``torch``, ``anthropic``, ``openai``, or ``chatterbox`` at module load. Both providers are
@@ -36,10 +38,11 @@ from pathlib import Path
 from types import FrameType
 from typing import TYPE_CHECKING
 
+from casttrophizer.audio.synthesize import unresolved_speakers
 from casttrophizer.config import AppConfig
 from casttrophizer.domain.enums import ReviewStatus, StageName
 from casttrophizer.domain.ids import new_id
-from casttrophizer.domain.models import Book, Project, Speaker
+from casttrophizer.domain.models import Book, Project, Speaker, VoiceClip
 from casttrophizer.domain.serialization import CURRENT_SCHEMA_VERSION
 from casttrophizer.ebook import parser_for
 from casttrophizer.errors import CasttrophizerError, ConfigError
@@ -477,6 +480,11 @@ def _report_run(
                     f"  assign a voice: castrun assign-voice {index} <clip.wav>"
                     f"  (speaker: {speaker.name})"
                 )
+        if blockers.unassigned_voices:
+            print(
+                "  or bulk-voice the rest by category: "
+                "castrun assign-voice --rest --default <clip.wav>"
+            )
         return _EXIT_NEEDS_REVIEW
 
     if result.status == ReviewStatus.STOPPED:
@@ -516,14 +524,27 @@ def cmd_speakers(args: argparse.Namespace, deps: CliDeps) -> int:
         return _EXIT_OK
     for index, speaker in enumerate(project.speakers):
         state = "voiced" if _speaker_has_voice(project, speaker) else "NO VOICE"
-        print(f"[{index}] {speaker.name} ({speaker.role.value}) - {state}")
+        print(
+            f"[{index}] {speaker.name} ({speaker.role.value}) "
+            f"[{speaker.category.value}] - {state}"
+        )
     return _EXIT_OK
 
 
 def cmd_assign_voice(args: argparse.Namespace, deps: CliDeps) -> int:
-    """Register a read-only clip and assign it to a speaker (narrator included)."""
+    """Assign a voice clip to one speaker, or (``--rest``) bulk-voice the remaining cast."""
     store = _require_store(args)
     project = store.load()
+
+    if args.rest:
+        return _cmd_assign_voice_rest(args, deps, store, project)
+
+    if args.speaker is None or args.clip is None:
+        raise CliError(
+            "assign-voice requires SPEAKER and CLIP (or pass --rest to voice the remaining "
+            "cast by category)",
+            code=_EXIT_ERROR,
+        )
     speaker = _resolve_speaker(project, args.speaker)
 
     svc = ReviewService(store, project)
@@ -533,6 +554,104 @@ def cmd_assign_voice(args: argparse.Namespace, deps: CliDeps) -> int:
         raise CliError(str(exc), code=_EXIT_ERROR) from exc
     svc.assign_voice(speaker, clip)
     print(f"assigned {Path(args.clip).name} to {speaker.name}")
+    return _EXIT_OK
+
+
+#: Per-category ``--rest`` flags (the ``VoiceCategory`` members with a dedicated flag). The
+#: ``unknown`` category has no flag — it resolves straight to ``--default``.
+_REST_CATEGORY_FLAGS = ("man", "woman", "boy", "girl")
+
+
+def _resolve_category_clip(
+    category: str, args: argparse.Namespace, config: AppConfig
+) -> str | None:
+    """Resolve one voice category to a clip path: flag > env default > ``--default`` fallback.
+
+    ``--man/--woman/...`` win over the matching ``CASTTROPHIZER_VOICE_*`` env default, which
+    wins over the shared ``--default`` (which itself wins over ``CASTTROPHIZER_VOICE_DEFAULT``).
+    A category with no flag (``unknown``) or no per-category value falls back to the default;
+    returns ``None`` when nothing resolves (an uncovered category).
+    """
+    default_path = args.default or config.voice_defaults.get("default")
+    if category in _REST_CATEGORY_FLAGS:
+        flag_value = getattr(args, category)
+        return flag_value or config.voice_defaults.get(category) or default_path
+    return default_path  # unknown / any future flagless category
+
+
+def _cmd_assign_voice_rest(
+    args: argparse.Namespace,
+    deps: CliDeps,
+    store: WorkspaceStore,
+    project: Project,
+) -> int:
+    """Bulk-assign category default clips to every referenced, still-unvoiced speaker.
+
+    Targets exactly the speakers the review gate flags (``unresolved_speakers`` — shares the
+    synthesize precheck predicate, so the ``<unattributed>`` sentinel is excluded: ``--rest``
+    cannot fix a speaker-less segment). Validates full coverage up front — if any target's
+    category resolves to no clip, fails without assigning anything (never leaves a referenced
+    speaker unvoiced, which would re-block the gate). Registers one shared ``VoiceClip`` per
+    distinct path (validating each path exists) and persists all assignments in a single save.
+    """
+    if args.speaker is not None or args.clip is not None:
+        raise CliError(
+            "assign-voice --rest takes no positional SPEAKER/CLIP arguments", code=_EXIT_ERROR
+        )
+    config = deps.config or AppConfig.from_env()
+
+    targets = unresolved_speakers(project)
+    if not targets:
+        print("all referenced speakers already voiced; nothing to assign")
+        return _EXIT_OK
+
+    # Resolve each target's clip and collect any uncovered categories (dry run, no mutation).
+    resolved: list[tuple[Speaker, str]] = []  # (speaker, clip path)
+    uncovered: dict[str, list[str]] = {}  # category -> speaker names with no clip
+    for speaker in targets:
+        category = speaker.category.value
+        path = _resolve_category_clip(category, args, config)
+        if path is None:
+            uncovered.setdefault(category, []).append(speaker.name)
+        else:
+            resolved.append((speaker, path))
+
+    if uncovered:
+        detail = "; ".join(
+            f"{category} (speakers: {', '.join(names)})" for category, names in uncovered.items()
+        )
+        hint_flags = sorted(
+            f"--{category}" for category in uncovered if category in _REST_CATEGORY_FLAGS
+        )
+        hint = " / ".join([*hint_flags, "--default"])  # --default always applies (covers unknown)
+        raise CliError(
+            f"no clip for categories: {detail}; pass {hint}",
+            code=_EXIT_ERROR,
+        )
+
+    # Coverage is complete: register one shared VoiceClip per distinct path (validates each
+    # path exists, raising ValueError before anything is persisted), then batch-assign + save.
+    svc = ReviewService(store, project)
+    clips_by_path: dict[str, VoiceClip] = {}
+    counts: dict[str, int] = {}
+    pairs: list[tuple[Speaker, VoiceClip]] = []
+    for speaker, path in resolved:
+        clip = clips_by_path.get(path)
+        if clip is None:
+            try:
+                clip = actions.register_voice_clip(
+                    project, path, label=f"{speaker.category.value} (default)"
+                )
+            except ValueError as exc:
+                raise CliError(str(exc), code=_EXIT_ERROR) from exc
+            clips_by_path[path] = clip
+        pairs.append((speaker, clip))
+        counts[speaker.category.value] = counts.get(speaker.category.value, 0) + 1
+
+    svc.assign_voices(pairs)
+
+    breakdown = ", ".join(f"{category} x{n}" for category, n in sorted(counts.items()))
+    print(f"assigned defaults to {len(pairs)} speaker(s): {breakdown}")
     return _EXIT_OK
 
 
@@ -578,9 +697,38 @@ def _build_parser() -> argparse.ArgumentParser:
     p_speakers = sub.add_parser("speakers", help="list discovered speakers and their voice state")
     p_speakers.set_defaults(func=cmd_speakers)
 
-    p_assign = sub.add_parser("assign-voice", help="assign a voice clip to a speaker")
-    p_assign.add_argument("speaker", help="speaker list index or name (case-insensitive)")
-    p_assign.add_argument("clip", help="path to the reference voice clip (read-only input)")
+    p_assign = sub.add_parser(
+        "assign-voice",
+        help="assign a voice clip to a speaker, or --rest to voice the remaining cast",
+    )
+    p_assign.add_argument(
+        "speaker",
+        nargs="?",
+        default=None,
+        help="speaker list index or name (case-insensitive); omit with --rest",
+    )
+    p_assign.add_argument(
+        "clip",
+        nargs="?",
+        default=None,
+        help="path to the reference voice clip (read-only input); omit with --rest",
+    )
+    p_assign.add_argument(
+        "--rest",
+        action="store_true",
+        help="assign category default clips to every still-unvoiced referenced speaker",
+    )
+    p_assign.add_argument("--man", default=None, help="default clip for `man` speakers (--rest)")
+    p_assign.add_argument(
+        "--woman", default=None, help="default clip for `woman` speakers (--rest)"
+    )
+    p_assign.add_argument("--boy", default=None, help="default clip for `boy` speakers (--rest)")
+    p_assign.add_argument("--girl", default=None, help="default clip for `girl` speakers (--rest)")
+    p_assign.add_argument(
+        "--default",
+        default=None,
+        help="fallback clip for `unknown`/uncovered speakers (--rest)",
+    )
     p_assign.set_defaults(func=cmd_assign_voice)
 
     return parser

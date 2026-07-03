@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
+from casttrophizer.domain.enums import VoiceCategory
 from casttrophizer.domain.models import Project
 from casttrophizer.domain.serialization import (
     CURRENT_SCHEMA_VERSION,
@@ -90,6 +93,42 @@ def test_round_trip_detects_a_changed_value(sample_project: Project) -> None:
     assert restored != sample_project
 
 
+def test_voice_category_round_trips(sample_project: Project) -> None:
+    # Stamp non-default categories and confirm they survive project_to_dict/from_dict.
+    sample_project.speakers[0].category = VoiceCategory.MAN
+    sample_project.speakers[1].category = VoiceCategory.WOMAN
+    restored = project_from_dict(project_to_dict(sample_project))
+    assert [sp.category for sp in restored.speakers] == [
+        VoiceCategory.MAN,
+        VoiceCategory.WOMAN,
+    ]
+    assert restored == sample_project
+
+
+def test_v1_to_v2_migration_defaults_speakers_to_unknown(sample_project: Project) -> None:
+    # A hand-built v1 dict (schema_version=1, no per-speaker `category` key) must migrate:
+    # every speaker defaults to `unknown` and the loaded project re-serializes at v2.
+    data = project_to_dict(sample_project)
+    data["schema_version"] = 1
+    for speaker in data["speakers"]:
+        del speaker["category"]
+
+    restored = project_from_dict(data)
+    assert restored.schema_version == CURRENT_SCHEMA_VERSION == 2
+    assert all(sp.category == VoiceCategory.UNKNOWN for sp in restored.speakers)
+    # Re-serializing stamps v2 and writes the category key back.
+    reserialized = project_to_dict(restored)
+    assert reserialized["schema_version"] == 2
+    assert all(sp["category"] == "unknown" for sp in reserialized["speakers"])
+
+
+def test_voice_category_coerce_maps_unknown_strings() -> None:
+    assert VoiceCategory.coerce("MAN") is VoiceCategory.MAN
+    assert VoiceCategory.coerce("  Woman ") is VoiceCategory.WOMAN
+    assert VoiceCategory.coerce("android") is VoiceCategory.UNKNOWN
+    assert VoiceCategory.coerce(None) is VoiceCategory.UNKNOWN
+
+
 def test_round_trip_via_json_text_is_lossless(sample_project: Project) -> None:
     # The on-disk path is JSON text; round-tripping through json.dumps/loads (not just the
     # dict) confirms every value is JSON-native and survives serialization.
@@ -98,3 +137,67 @@ def test_round_trip_via_json_text_is_lossless(sample_project: Project) -> None:
     blob = json.dumps(project_to_dict(sample_project))
     restored = project_from_dict(json.loads(blob))
     assert restored == sample_project
+
+
+def test_v2_garbage_category_is_a_load_error_not_silently_coerced(
+    sample_project: Project,
+) -> None:
+    # STRICT load-time validation (the whole point of a StrEnum per the plan/design): a
+    # *persisted* v2 project whose category is not a real VoiceCategory member is a corrupt
+    # file, surfaced as SerializationError — NOT silently coerced to `unknown`. (VoiceCategory
+    # .coerce is only for the provider->domain boundary, never the on-disk load path, which
+    # uses VoiceCategory(d["category"]).) This pins the intended fail-loud behavior so a future
+    # loosening of the loader is a conscious change.
+    data = project_to_dict(sample_project)
+    data["speakers"][0]["category"] = "wizard"  # not a VoiceCategory member
+    with pytest.raises(SerializationError):
+        project_from_dict(data)
+
+
+def test_v1_to_v2_preserves_a_category_key_if_somehow_present(
+    sample_project: Project,
+) -> None:
+    # The migration uses setdefault, so a v1 dict that (unexpectedly) already carries a
+    # category is not clobbered back to `unknown`. Guards the "add missing default" semantics.
+    data = project_to_dict(sample_project)
+    data["schema_version"] = 1
+    data["speakers"][0]["category"] = "man"  # pre-existing value survives migration
+    del data["speakers"][1]["category"]  # this one gets the default
+    restored = project_from_dict(data)
+    assert restored.speakers[0].category == VoiceCategory.MAN
+    assert restored.speakers[1].category == VoiceCategory.UNKNOWN
+
+
+def test_v1_project_on_disk_migrates_through_the_workspace_store(
+    sample_project: Project,
+) -> None:
+    # Real-project safety (protects the user's existing `.\work\eb1` v1 workspace): write a
+    # v1-shaped project.json to disk (schema_version=1, speakers with NO `category` key) and
+    # load it through the ACTUAL WorkspaceStore path (read_text -> json.loads -> migrate), the
+    # same code `castrun` runs. Every speaker must migrate to `unknown`, and a subsequent save
+    # must re-persist the file at v2 with the category keys written back.
+    import json
+
+    from casttrophizer.workspace.layout import WorkspaceLayout
+    from casttrophizer.workspace.store import WorkspaceStore
+
+    root = Path(sample_project.workspace_dir)
+    store = WorkspaceStore(WorkspaceLayout.for_dir(root))
+    store.save(sample_project)  # produces a valid v2 file first
+
+    # Downgrade the on-disk file to a v1 shape by hand (as a pre-feature project would look).
+    v1 = json.loads(store.layout.project_file.read_text(encoding="utf-8"))
+    v1["schema_version"] = 1
+    for speaker in v1["speakers"]:
+        del speaker["category"]
+    store.layout.project_file.write_text(json.dumps(v1, indent=2), encoding="utf-8")
+
+    loaded = store.load()  # the exact path the CLI uses
+    assert loaded.schema_version == CURRENT_SCHEMA_VERSION == 2
+    assert all(sp.category == VoiceCategory.UNKNOWN for sp in loaded.speakers)
+
+    # Re-save and confirm the file is now a clean v2 with category keys present.
+    store.save(loaded)
+    reread = json.loads(store.layout.project_file.read_text(encoding="utf-8"))
+    assert reread["schema_version"] == 2
+    assert all(sp["category"] == "unknown" for sp in reread["speakers"])

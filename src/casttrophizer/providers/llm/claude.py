@@ -19,7 +19,13 @@ import json
 from typing import Any
 
 from casttrophizer.errors import LLMProviderError
-from casttrophizer.providers.base import AttributionCandidate, LLMMessage, LLMProvider
+from casttrophizer.providers.base import (
+    AttributionCandidate,
+    LLMMessage,
+    LLMProvider,
+    SpeakerClassification,
+    SpeakerProfile,
+)
 
 __all__ = ["ClaudeProvider"]
 
@@ -61,6 +67,44 @@ _ATTRIBUTION_SCHEMA: dict[str, Any] = {
 
 #: Speaker strings the model may use for the narrator (besides JSON null), case-folded.
 _NARRATOR_ALIASES = frozenset({"narrator", "the narrator"})
+
+#: System prompt for the one-shot per-speaker voice-category classification pass. The user
+#: message carries a numbered list of speakers (keyed by ``speaker_id``) with a few sample
+#: lines each; the model returns strict JSON the provider parses.
+_CLASSIFY_SYSTEM = (
+    "You bucket each listed speaker in a work of fiction into one voice category, using "
+    "the character's name and sample dialogue as evidence. Categories are exactly: 'man' "
+    "(adult male), 'woman' (adult female), 'boy' (young male), 'girl' (young female), or "
+    "'unknown'. Use 'unknown' when gender or age is unclear, or the speaker is non-human or "
+    "otherwise doesn't fit. Return strict JSON matching the requested schema: exactly one "
+    "entry per requested speaker_id, each with a confidence in [0,1]."
+)
+
+#: JSON schema constraining the classification response (one entry per requested speaker id).
+_CLASSIFY_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "classifications": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "speaker_id": {"type": "string"},
+                    "category": {
+                        "type": "string",
+                        "enum": ["man", "woman", "boy", "girl", "unknown"],
+                    },
+                    "confidence": {"type": "number"},
+                    "rationale": {"type": "string"},
+                },
+                "required": ["speaker_id", "category", "confidence"],
+                "additionalProperties": False,
+            },
+        }
+    },
+    "required": ["classifications"],
+    "additionalProperties": False,
+}
 
 
 class ClaudeProvider(LLMProvider):
@@ -191,6 +235,93 @@ class ClaudeProvider(LLMProvider):
                 ),
             )
             for seg_id in candidates
+        ]
+
+    def classify_speakers(self, *, speakers: list[SpeakerProfile]) -> list[SpeakerClassification]:
+        """Bucket each requested speaker into a voice category, one entry per requested id.
+
+        Mirrors :meth:`attribute_speakers`: prompts the model for strict JSON, parses it,
+        enforces one-per-requested-id (a missing id defaults to a 0.0-confidence ``unknown``),
+        and drops unrequested ids. Non-JSON / wrong-shape output raises
+        ``LLMProviderError(malformed=True)``; reachability failures raise a plain
+        ``LLMProviderError``. The classification orchestration catches BOTH and leaves
+        categories ``unknown`` (this pass is non-critical and never fails the attribute stage).
+        An empty ``speakers`` list makes no API call.
+        """
+        if not speakers:
+            return []
+
+        import anthropic  # local import: keep module load cheap and offline-safe
+
+        user = self._render_classify_prompt(speakers)
+        try:
+            response = self._client().messages.create(
+                model=self._model,
+                max_tokens=4096,
+                thinking={"type": "adaptive"},
+                system=_CLASSIFY_SYSTEM,
+                output_config={"format": {"type": "json_schema", "schema": _CLASSIFY_SCHEMA}},
+                messages=[{"role": "user", "content": user}],
+            )
+        except anthropic.AnthropicError as exc:  # reachability/credentials/HTTP
+            raise LLMProviderError(f"Claude classification request failed: {exc}") from exc
+
+        text = "".join(
+            block.text for block in response.content if getattr(block, "type", None) == "text"
+        )
+        return self._parse_classifications(text, [s.speaker_id for s in speakers])
+
+    @staticmethod
+    def _render_classify_prompt(speakers: list[SpeakerProfile]) -> str:
+        """Render the deterministic user message: a numbered list keyed by ``speaker_id``."""
+        lines_out = ["Classify each speaker's voice category. Speakers:"]
+        for profile in speakers:
+            samples = " ".join(profile.samples).strip()
+            sample_note = f" — sample lines: {samples}" if samples else " — (no sample lines)"
+            lines_out.append(f"[{profile.speaker_id}] {profile.name}{sample_note}")
+        lines_out.append("Return one entry per speaker_id.")
+        return "\n".join(lines_out)
+
+    @staticmethod
+    def _parse_classifications(text: str, speaker_ids: list[str]) -> list[SpeakerClassification]:
+        """Parse the model's JSON into one ``SpeakerClassification`` per requested id."""
+        try:
+            data = json.loads(text)
+            entries = data["classifications"]
+            if not isinstance(entries, list):
+                raise TypeError("'classifications' is not a list")
+        except (json.JSONDecodeError, KeyError, TypeError) as exc:
+            raise LLMProviderError(
+                f"Claude returned non-conforming classification JSON: {exc}", malformed=True
+            ) from exc
+
+        requested = set(speaker_ids)
+        by_id: dict[str, SpeakerClassification] = {}
+        for entry in entries:
+            try:
+                speaker_id = str(entry["speaker_id"])
+            except (TypeError, KeyError) as exc:
+                raise LLMProviderError(
+                    f"classification entry missing 'speaker_id': {exc}", malformed=True
+                ) from exc
+            if speaker_id not in requested:
+                continue  # defensive: drop ids we did not request
+            by_id[speaker_id] = SpeakerClassification(
+                speaker_id=speaker_id,
+                category=str(entry.get("category", "unknown")),
+                confidence=float(entry.get("confidence", 0.0)),
+                rationale=str(entry.get("rationale", "")),
+            )
+
+        # Enforce one-per-requested-id: a missing id -> 0.0-confidence 'unknown' default.
+        return [
+            by_id.get(
+                speaker_id,
+                SpeakerClassification(
+                    speaker_id=speaker_id, category="unknown", confidence=0.0, rationale="missing"
+                ),
+            )
+            for speaker_id in speaker_ids
         ]
 
     def is_available(self) -> bool:

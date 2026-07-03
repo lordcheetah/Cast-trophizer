@@ -13,6 +13,7 @@ memory at the call site — the default below is the current Claude model id.
 from __future__ import annotations
 
 import os
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -55,6 +56,12 @@ class AppConfig:
         lmstudio_base_url: LM Studio OpenAI-compatible base URL.
         workspaces_root: Default parent directory for new project workspaces.
         tts_params: Global synthesis defaults merged into per-segment requests.
+        voice_defaults: Reusable per-category default voice-clip paths for
+            ``assign-voice --rest``. Keys are ``VoiceCategory`` values (``"man"`` / ``"woman"``
+            / ``"boy"`` / ``"girl"``) plus ``"default"`` (the ``unknown``/uncovered fallback);
+            values are absolute clip paths. Populated from ``CASTTROPHIZER_VOICE_*`` env vars so
+            a user sets category clips once instead of retyping them each run. Explicit
+            ``--man/--woman/...`` flags override these; an absent flag falls back to the mapping.
     """
 
     llm_provider: LLMProviderName = "claude"
@@ -73,6 +80,8 @@ class AppConfig:
 
     tts_params: dict[str, object] = field(default_factory=dict)
 
+    voice_defaults: dict[str, str] = field(default_factory=dict)
+
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> AppConfig:
         """Build a config from environment variables, falling back to defaults.
@@ -81,7 +90,9 @@ class AppConfig:
             ``CASTTROPHIZER_LLM_PROVIDER``, ``CASTTROPHIZER_LLM_BACKUP``,
             ``CASTTROPHIZER_TTS_PROVIDER``, ``CASTTROPHIZER_CLAUDE_MODEL``,
             ``ANTHROPIC_API_KEY``, ``CASTTROPHIZER_LMSTUDIO_MODEL``,
-            ``CASTTROPHIZER_LMSTUDIO_BASE_URL``, ``CASTTROPHIZER_WORKSPACES_ROOT``.
+            ``CASTTROPHIZER_LMSTUDIO_BASE_URL``, ``CASTTROPHIZER_WORKSPACES_ROOT``,
+            ``CASTTROPHIZER_VOICE_MAN`` / ``_WOMAN`` / ``_BOY`` / ``_GIRL`` / ``_DEFAULT``
+            (reusable ``assign-voice --rest`` default clips -> :attr:`voice_defaults`).
         """
         src = os.environ if env is None else env
         cfg = cls()
@@ -94,4 +105,24 @@ class AppConfig:
         cfg.lmstudio_base_url = src.get("CASTTROPHIZER_LMSTUDIO_BASE_URL", cfg.lmstudio_base_url)
         if (root := src.get("CASTTROPHIZER_WORKSPACES_ROOT")) is not None:
             cfg.workspaces_root = Path(root)
+        cfg.voice_defaults = _voice_defaults_from_env(src)
         return cfg
+
+
+#: Maps a ``voice_defaults`` key to its ``CASTTROPHIZER_VOICE_*`` env var. Keys are
+#: ``VoiceCategory`` values plus ``"default"`` (kept as plain strings so ``config`` stays
+#: free of any domain import).
+_VOICE_DEFAULT_ENV = {
+    "man": "CASTTROPHIZER_VOICE_MAN",
+    "woman": "CASTTROPHIZER_VOICE_WOMAN",
+    "boy": "CASTTROPHIZER_VOICE_BOY",
+    "girl": "CASTTROPHIZER_VOICE_GIRL",
+    "default": "CASTTROPHIZER_VOICE_DEFAULT",
+}
+
+
+def _voice_defaults_from_env(src: Mapping[str, str]) -> dict[str, str]:
+    """Collect the set ``CASTTROPHIZER_VOICE_*`` vars into a category->path mapping."""
+    return {
+        key: src[var] for key, var in _VOICE_DEFAULT_ENV.items() if src.get(var) not in (None, "")
+    }

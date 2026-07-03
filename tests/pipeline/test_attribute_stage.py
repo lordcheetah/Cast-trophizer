@@ -16,7 +16,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from casttrophizer.attribution.attribute import MAX_LINES_PER_BATCH
-from casttrophizer.domain.enums import ReviewStatus, SpeakerRole, StageName
+from casttrophizer.domain.enums import ReviewStatus, SpeakerRole, StageName, VoiceCategory
 from casttrophizer.domain.ids import new_id
 from casttrophizer.domain.models import Book, Chapter, Line, Project, Segment, Speaker
 from casttrophizer.domain.serialization import CURRENT_SCHEMA_VERSION
@@ -539,6 +539,112 @@ def test_pipeline_next_stage_advances_to_review(
     reloaded = tmp_workspace.load()
     # The only stage is attribute, now complete -> next_stage is None.
     assert pipeline.next_stage(reloaded) is None
+
+
+# --------------------------------------------------------------------------- #
+# voice-category classification pass (finishing pass; soft; not re-run on resume)
+# --------------------------------------------------------------------------- #
+def _classify_llm() -> FakeLLMProvider:
+    """Attribution as ``_scripted_llm`` + a classification script for Alice/Bob."""
+    return FakeLLMProvider(
+        text_script={
+            '"Hello,"': ("Alice", 0.9),
+            '"Hi,"': ("Bob", 0.5),
+            '"We meet again,"': ("Alice", 0.95),
+        },
+        classify_script={"Alice": ("woman", 0.9), "Bob": ("man", 0.9)},
+    )
+
+
+def test_classification_stamps_categories_and_narrator_stays_unknown(
+    tmp_workspace: WorkspaceStore, attribute_ready_project: Project
+) -> None:
+    llm = _classify_llm()
+    result = SegmentAttributeStage().run(
+        attribute_ready_project, _ctx(tmp_workspace, RecordingProgressReporter(), llm)
+    )
+    assert result.status == ReviewStatus.COMPLETED
+
+    reloaded = tmp_workspace.load()
+    by_name = {s.name: s for s in reloaded.speakers}
+    assert by_name["Alice"].category == VoiceCategory.WOMAN
+    assert by_name["Bob"].category == VoiceCategory.MAN
+    # The narrator is never sent for classification -> stays unknown.
+    assert by_name["narrator"].category == VoiceCategory.UNKNOWN
+    # Exactly ONE classification pass, over the two discovered CHARACTER speakers.
+    assert len(llm.classify_calls) == 1
+    assert {p.name for p in llm.classify_calls[0]} == {"Alice", "Bob"}
+
+
+def test_classification_unreachable_is_soft_stage_still_completed(
+    tmp_workspace: WorkspaceStore, attribute_ready_project: Project
+) -> None:
+    # A classifier that raises a reachability error must NOT fail the (successful) attribution.
+    llm = FakeLLMProvider(
+        text_script={
+            '"Hello,"': ("Alice", 0.9),
+            '"Hi,"': ("Bob", 0.5),
+            '"We meet again,"': ("Alice", 0.95),
+        },
+        raise_classify_unreachable=True,
+    )
+    result = SegmentAttributeStage().run(
+        attribute_ready_project, _ctx(tmp_workspace, RecordingProgressReporter(), llm)
+    )
+    assert result.status == ReviewStatus.COMPLETED
+    reloaded = tmp_workspace.load()
+    assert reloaded.stage_status[str(StageName.ATTRIBUTE)] == ReviewStatus.COMPLETED
+    assert all(s.category == VoiceCategory.UNKNOWN for s in reloaded.speakers)
+
+
+def test_classification_malformed_is_soft_stage_still_completed(
+    tmp_workspace: WorkspaceStore, attribute_ready_project: Project
+) -> None:
+    llm = FakeLLMProvider(
+        text_script={
+            '"Hello,"': ("Alice", 0.9),
+            '"Hi,"': ("Bob", 0.5),
+            '"We meet again,"': ("Alice", 0.95),
+        },
+        raise_classify_malformed=True,
+    )
+    result = SegmentAttributeStage().run(
+        attribute_ready_project, _ctx(tmp_workspace, RecordingProgressReporter(), llm)
+    )
+    assert result.status == ReviewStatus.COMPLETED
+    reloaded = tmp_workspace.load()
+    assert all(s.category == VoiceCategory.UNKNOWN for s in reloaded.speakers)
+
+
+def test_classification_not_re_run_once_categories_are_set(
+    tmp_workspace: WorkspaceStore, attribute_ready_project: Project
+) -> None:
+    # Second run on the already-attributed+classified project must not reclassify: every
+    # CHARACTER speaker already has a non-unknown category, so no profiles are sent.
+    stage = SegmentAttributeStage()
+    llm = _classify_llm()
+    stage.run(attribute_ready_project, _ctx(tmp_workspace, RecordingProgressReporter(), llm))
+    assert len(llm.classify_calls) == 1
+
+    reloaded = tmp_workspace.load()
+    stage.run(reloaded, _ctx(tmp_workspace, RecordingProgressReporter(), llm))
+    assert len(llm.classify_calls) == 1  # no second classification call
+
+
+def test_resumed_pipeline_run_makes_zero_classify_calls(
+    tmp_workspace: WorkspaceStore, attribute_ready_project: Project
+) -> None:
+    # Drive the stage through the actual Pipeline (which skips COMPLETED stages via
+    # is_complete). Once attribute is COMPLETED, a second Pipeline.run must NOT re-enter the
+    # stage — so the classification pass fires exactly once across both runs, never on resume.
+    llm = _classify_llm()
+    pipeline = Pipeline([SegmentAttributeStage()])
+    pipeline.run(_ctx(tmp_workspace, RecordingProgressReporter(), llm))
+    assert len(llm.classify_calls) == 1  # classified on the finishing pass
+
+    # A resumed run over the now-COMPLETED project: the stage is skipped entirely.
+    pipeline.run(_ctx(tmp_workspace, RecordingProgressReporter(), llm))
+    assert len(llm.classify_calls) == 1  # zero additional classification calls on resume
 
 
 def test_line_text_untouched(
