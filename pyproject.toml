@@ -36,6 +36,7 @@ dev = [
 
 [project.scripts]
 casttrophizer = "casttrophizer.ui.app:main"
+castrun = "casttrophizer.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/casttrophizer"]
