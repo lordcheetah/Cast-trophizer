@@ -22,6 +22,8 @@ htmlcov/
 
 # Project workspaces (per-project derived artifacts)
 workspaces/
+# Smoke-test / scratch workspaces (scripts/smoke_test.py --workdir)
+.smoke-out/
 
 # Editors / OS
 .idea/

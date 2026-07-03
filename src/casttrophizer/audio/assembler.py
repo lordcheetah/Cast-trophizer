@@ -152,16 +152,20 @@ class M4BAssembler:
 
 
 def _write_concat_list(list_path: Path, audio_paths: list[Path]) -> None:
-    """Write the ffmpeg concat-demuxer file list (one ``file '<abs path>'`` per WAV)."""
-    # VERIFY: the concat-demuxer line format + path escaping, especially on Windows with
-    #   backslashes/quotes/unicode in a path. The concat demuxer wants:  file '<path>'
-    #   with embedded single-quotes escaped as  '\''  and (on Windows) forward slashes are
-    #   generally accepted by ffmpeg. Confirm the exact escaping rule against ffmpeg docs.
+    """Write the ffmpeg concat-demuxer file list (one ``file '<abs path>'`` per WAV).
+
+    Entries MUST be absolute: the concat demuxer resolves a relative entry against the
+    **list file's own directory** (here, the temp build dir), not the process CWD — so a
+    relative workspace path (e.g. ``--workdir .smoke-out``) would resolve to a bogus
+    ``<build_dir>/.smoke-out/audio/...``. We ``resolve()`` every path to sidestep that.
+    """
+    # VERIFY (confirmed at runtime): line format ``file '<path>'`` with single-quotes escaped
+    #   as ``'\''``; ffmpeg accepts forward slashes on Windows. Paths are absolute (see above).
     lines: list[str] = []
     for path in audio_paths:
-        # ffmpeg accepts forward slashes on Windows; normalize so a Windows backslash is not
-        # mistaken for an escape inside the single-quoted concat entry.
-        text = path.as_posix().replace("'", "'\\''")
+        # Absolute + forward-slashed so it's unambiguous to the concat demuxer and a Windows
+        # backslash is never mistaken for an escape inside the single-quoted entry.
+        text = path.resolve().as_posix().replace("'", "'\\''")
         lines.append(f"file '{text}'")
     list_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 

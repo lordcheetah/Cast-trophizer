@@ -122,8 +122,8 @@ def test_assemble_success_writes_output_and_intermediates(
     concat = captured["concat_list"]
     assert isinstance(concat, str)
     assert concat.splitlines() == [
-        f"file '{(tmp_path / 'output' / 'a.wav').as_posix()}'",
-        f"file '{(tmp_path / 'output' / 'b.wav').as_posix()}'",
+        f"file '{(tmp_path / 'output' / 'a.wav').resolve().as_posix()}'",
+        f"file '{(tmp_path / 'output' / 'b.wav').resolve().as_posix()}'",
     ]
     # ffmetadata has one [CHAPTER] block per marker with escaped title + ms START/END.
     ffmeta = captured["ffmeta"]
@@ -283,6 +283,47 @@ def test_concat_list_escapes_single_quote_in_path(
     M4BAssembler().assemble(req)
     # The embedded single-quote becomes '\'' inside the single-quoted concat entry.
     assert "O'\\''Brien.wav" in captured["concat"]
+
+
+def test_concat_list_entries_are_absolute_for_relative_inputs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stub_mutagen: type[_StubMP4]
+) -> None:
+    """Relative segment paths (e.g. a relative --workdir) must be written ABSOLUTE.
+
+    Regression: ffmpeg's concat demuxer resolves a relative entry against the list file's
+    own directory (the temp build dir), not the process CWD — so a relative
+    ``.smoke-out/audio/x.wav`` became a bogus ``<build_dir>/.smoke-out/audio/x.wav`` and
+    ffmpeg failed with "No such file or directory". Entries are now ``resolve()``-d.
+    """
+    captured: dict[str, str] = {}
+
+    def fake_run(cmd: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        concat_list = Path(cmd[cmd.index("-i") + 1])
+        captured["concat"] = concat_list.read_text(encoding="utf-8")
+        Path(cmd[-1]).write_bytes(b"ENCODED")
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.chdir(tmp_path)  # so a relative segment path resolves under tmp_path
+
+    seg_dir = tmp_path / "ws" / "audio"
+    seg_dir.mkdir(parents=True, exist_ok=True)
+    (seg_dir / "x.wav").write_bytes(b"WAV")
+    relative_seg = Path("ws") / "audio" / "x.wav"  # relative to CWD (tmp_path)
+    assert not relative_seg.is_absolute()
+
+    req = AssemblyRequest(
+        segment_audio_paths=[relative_seg],
+        chapters=[ChapterMarker(title="One", start_s=0.0, end_s=1.0)],
+        out_path=Path("ws") / "output" / "book.m4b",  # relative out too, like --workdir .smoke-out
+        title="B",
+        author="A",
+    )
+    M4BAssembler().assemble(req)
+
+    expected = (tmp_path / "ws" / "audio" / "x.wav").resolve().as_posix()
+    assert captured["concat"].splitlines() == [f"file '{expected}'"]
+    assert "file 'ws/audio/x.wav'" not in captured["concat"]  # never the bare relative path
 
 
 # --------------------------------------------------------------------------- #
