@@ -71,11 +71,11 @@ class PrintReporter:
 
     def advance(self, n: int = 1, *, message: str | None = None) -> None:
         self._done += n
-        suffix = f" — {message}" if message else ""
+        suffix = f" - {message}" if message else ""
         print(f"    [{self._done}/{self._total}]{suffix}")
 
     def message(self, text: str) -> None:
-        print(f"    · {text}")
+        print(f"    - {text}")
 
     def should_stop(self) -> bool:
         return False
@@ -244,7 +244,7 @@ def main(argv: list[str]) -> int:
 
     # ---- Stage 1: SYNTHESIZE (real Chatterbox — exercises providers/tts/chatterbox.py) ----
     print("== SYNTHESIZE (real Chatterbox) ==")
-    print("  (first run downloads the model — this can take a few minutes)")
+    print("  (first run downloads the model - this can take a few minutes)")
     tts = ChatterboxProvider()
     if not tts.is_available():
         sys.exit(
@@ -280,7 +280,7 @@ def main(argv: list[str]) -> int:
 
     m4bs = list((store.layout.output_dir).glob("*.m4b"))
     print()
-    print("SMOKE TEST PASSED ✅")
+    print("SMOKE TEST PASSED")
     for m4b in m4bs:
         size_mb = m4b.stat().st_size / (1024 * 1024)
         print(f"  output: {m4b}  ({size_mb:.2f} MB)")

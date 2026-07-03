@@ -8,17 +8,22 @@ never loads torch.
 
 Distribution: ``chatterbox-tts``. Import path: ``from chatterbox.tts import ChatterboxTTS``.
 
-Real implementation. The Chatterbox API surface used here (model load, ``generate``
-signature, the voice-prompt parameter name, the sample-rate attribute, and how the waveform
-is written to a WAV) is written from the project's known/standard Chatterbox usage and is
-marked with ``# VERIFY:`` comments — it could not be verified against the installed package
-in CI (the ``tts`` extra is not installed) and must be confirmed by the user at runtime on a
-torch/GPU machine. The fake provider covers all stage tests; this code is exercised only on a
+Real implementation. Confirmed at runtime via ``scripts/smoke_test.py``:
+``ChatterboxTTS.from_pretrained(device=...)`` model load, ``model.generate(text,
+audio_prompt_path=<wav>)`` returning a float32 ``[1, N]`` tensor, and ``model.sr`` (24000).
+The WAV is written with the stdlib ``wave`` module (NOT ``torchaudio.save``, which now
+dispatches to TorchCodec — an extra native dep not in the ``tts`` extra). Remaining
+``# VERIFY:`` items are the parts the smoke run did not exercise: the ``exaggeration`` /
+``cfg_weight`` generate keywords (defaults only were used), seed determinism, and non-CUDA
+device selection (MPS). The fake provider covers all stage tests; this code runs only on a
 real render.
 """
 
 from __future__ import annotations
 
+import sys
+import wave
+from array import array
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +31,36 @@ from casttrophizer.errors import TTSProviderError
 from casttrophizer.providers.base import SynthesisRequest, SynthesisResult, TTSProvider
 
 __all__ = ["ChatterboxProvider"]
+
+
+def _to_pcm16(sample: float) -> int:
+    """Clamp a float sample in [-1, 1] and scale to a signed 16-bit PCM integer."""
+    value = int(sample * 32767.0)
+    if value < -32768:
+        return -32768
+    if value > 32767:
+        return 32767
+    return value
+
+
+def _write_wav_mono16(out_path: Path, samples: list[float], sample_rate: int) -> None:
+    """Write ``samples`` (float, mono) as a 16-bit PCM WAV via the stdlib ``wave`` module.
+
+    We deliberately do NOT use ``torchaudio.save``: torchaudio >= ~2.9 dispatches ``save`` to
+    TorchCodec, a separate native dependency that is not part of the ``tts`` extra (it raises
+    ``ImportError: TorchCodec is required``). Chatterbox output is a plain float waveform, so a
+    stdlib WAV write is both dependency-light and produces the standard 16-bit PCM the assemble
+    stage already reads for chapter timing.
+    """
+    pcm = array("h", (_to_pcm16(s) for s in samples))
+    if sys.byteorder == "big":  # WAV is little-endian; array is native-endian
+        pcm.byteswap()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with wave.open(str(out_path), "wb") as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(sample_rate)
+        wav_file.writeframes(pcm.tobytes())
 
 
 class ChatterboxProvider(TTSProvider):
@@ -78,7 +113,6 @@ class ChatterboxProvider(TTSProvider):
         normalized to :class:`~casttrophizer.errors.TTSProviderError`.
         """
         import torch  # lazy
-        import torchaudio  # lazy
 
         model = self._load_model()
         params = request.params
@@ -94,12 +128,12 @@ class ChatterboxProvider(TTSProvider):
         out_path.parent.mkdir(parents=True, exist_ok=True)
 
         try:
-            # VERIFY: generate signature — ``model.generate(text, audio_prompt_path=<wav>,
-            # exaggeration=<float>, cfg_weight=<float>)`` returns the waveform as a torch
-            # tensor. Confirm: (a) the positional text arg, (b) the voice-prompt keyword is
-            # ``audio_prompt_path`` taking a filesystem path to the reference clip, (c) the
-            # param keyword names (``exaggeration``, ``cfg_weight``), and (d) the return type/
-            # shape (a [channels, samples] or [samples] float tensor).
+            # Confirmed at runtime (smoke test): ``model.generate(text, audio_prompt_path=<wav>)``
+            # returns a float32 [1, N] torch tensor; the positional text arg and the
+            # ``audio_prompt_path`` voice-prompt keyword are correct.
+            # VERIFY (still unexercised): the ``exaggeration`` / ``cfg_weight`` keyword names —
+            # they were not passed in the smoke run (only defaults). Confirm these keywords before
+            # relying on those params.
             generate_kwargs: dict[str, Any] = {"audio_prompt_path": str(request.voice_clip_path)}
             if "exaggeration" in params:
                 generate_kwargs["exaggeration"] = float(params["exaggeration"])
@@ -108,19 +142,17 @@ class ChatterboxProvider(TTSProvider):
 
             wav = model.generate(request.text, **generate_kwargs)
 
-            # VERIFY: sample rate — Chatterbox exposes the output sample rate as ``model.sr``.
-            # Confirm the attribute name (``sr`` vs ``sample_rate``) against the package.
+            # Confirmed at runtime: Chatterbox exposes the output sample rate as ``model.sr``
+            # (24000) and ``generate`` returns a float32 [1, N] torch tensor.
             sample_rate = int(model.sr)
 
-            # VERIFY: waveform shape for saving — ``torchaudio.save`` expects a 2-D
-            # [channels, samples] tensor. If ``generate`` returns a 1-D [samples] tensor, add a
-            # channel dim; confirm the actual returned shape.
-            tensor = wav if hasattr(wav, "dim") else torch.as_tensor(wav)
-            if tensor.dim() == 1:
-                tensor = tensor.unsqueeze(0)
-            torchaudio.save(str(out_path), tensor.cpu(), sample_rate)
+            # Flatten to a mono float list and write a 16-bit PCM WAV with the stdlib (see
+            # _write_wav_mono16 for why torchaudio.save is avoided).
+            tensor = wav if hasattr(wav, "detach") else torch.as_tensor(wav)
+            samples: list[float] = tensor.detach().cpu().reshape(-1).tolist()
+            _write_wav_mono16(out_path, samples, sample_rate)
 
-            num_samples = int(tensor.shape[-1])
+            num_samples = len(samples)
         except TTSProviderError:
             raise
         except Exception as exc:  # noqa: BLE001 - normalize any synth failure to our error type

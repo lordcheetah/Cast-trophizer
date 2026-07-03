@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import sys
 import types
+import wave
 from pathlib import Path
 from typing import Any
 
@@ -36,25 +37,26 @@ from casttrophizer.providers.tts.chatterbox import ChatterboxProvider
 # fake torch / torchaudio / chatterbox.tts modules (offline stand-ins)
 # --------------------------------------------------------------------------- #
 class _FakeTensor:
-    """Minimal tensor stand-in supporting the ops ``synthesize`` uses on the waveform."""
+    """Minimal tensor stand-in supporting the ops ``synthesize`` uses on the waveform.
 
-    def __init__(self, samples: list[float], dims: int = 1) -> None:
+    ``synthesize`` does ``tensor.detach().cpu().reshape(-1).tolist()`` to get a flat mono
+    float list, then writes a 16-bit PCM WAV with the stdlib ``wave`` module.
+    """
+
+    def __init__(self, samples: list[float]) -> None:
         self._samples = samples
-        self._dims = dims
 
-    def dim(self) -> int:
-        return self._dims
-
-    def unsqueeze(self, _axis: int) -> _FakeTensor:
-        return _FakeTensor(self._samples, dims=self._dims + 1)
+    def detach(self) -> _FakeTensor:
+        return self
 
     def cpu(self) -> _FakeTensor:
         return self
 
-    @property
-    def shape(self) -> tuple[int, ...]:
-        # last dim is sample count, matching ``tensor.shape[-1]`` in synthesize
-        return (1, len(self._samples)) if self._dims == 2 else (len(self._samples),)
+    def reshape(self, *_shape: int) -> _FakeTensor:
+        return self  # the fake waveform is already flat/mono
+
+    def tolist(self) -> list[float]:
+        return list(self._samples)
 
 
 class _FakeModel:
@@ -69,7 +71,7 @@ class _FakeModel:
         self.generate_calls.append((text, kwargs))
         if self._raise:
             raise RuntimeError("model exploded")
-        return _FakeTensor([0.0, 0.1, -0.1, 0.0])  # 4 samples, 1-D
+        return _FakeTensor([0.0, 0.1, -0.1, 0.0])  # 4 mono samples
 
 
 def _install_fake_modules(
@@ -79,8 +81,12 @@ def _install_fake_modules(
     cuda_available: bool = False,
     from_pretrained_raises: bool = False,
 ) -> dict[str, Any]:
-    """Inject fake ``chatterbox.tts``, ``torch``, ``torchaudio`` modules; return recorders."""
-    recorder: dict[str, Any] = {"saved": None, "manual_seed": None, "cuda_seed": None}
+    """Inject fake ``chatterbox.tts`` and ``torch`` modules; return recorders.
+
+    ``synthesize`` writes the WAV with the stdlib ``wave`` module (not ``torchaudio``), so no
+    fake ``torchaudio`` is needed — tests assert on the real WAV file written to ``out_path``.
+    """
+    recorder: dict[str, Any] = {"manual_seed": None, "cuda_seed": None}
 
     # --- fake torch ---
     fake_torch = types.ModuleType("torch")
@@ -102,15 +108,6 @@ def _install_fake_modules(
     fake_torch.manual_seed = _manual_seed  # type: ignore[attr-defined]
     fake_torch.as_tensor = lambda x: _FakeTensor(list(x))  # type: ignore[attr-defined]
 
-    # --- fake torchaudio ---
-    fake_torchaudio = types.ModuleType("torchaudio")
-
-    def _save(path: str, tensor: Any, sample_rate: int) -> None:
-        recorder["saved"] = (path, tensor, sample_rate)
-        Path(path).write_bytes(b"RIFF....WAVEfake")  # write *something* so is_file() passes
-
-    fake_torchaudio.save = _save  # type: ignore[attr-defined]
-
     # --- fake chatterbox.tts ---
     fake_chatterbox = types.ModuleType("chatterbox")
     fake_chatterbox_tts = types.ModuleType("chatterbox.tts")
@@ -127,7 +124,6 @@ def _install_fake_modules(
     fake_chatterbox.tts = fake_chatterbox_tts  # type: ignore[attr-defined]
 
     monkeypatch.setitem(sys.modules, "torch", fake_torch)
-    monkeypatch.setitem(sys.modules, "torchaudio", fake_torchaudio)
     monkeypatch.setitem(sys.modules, "chatterbox", fake_chatterbox)
     monkeypatch.setitem(sys.modules, "chatterbox.tts", fake_chatterbox_tts)
     return recorder
@@ -151,12 +147,14 @@ def test_synthesize_writes_wav_and_maps_params(
     )
     result = provider.synthesize(req, out)
 
-    # WAV written to out_path (parent created).
+    # A real 16-bit PCM mono WAV was written to out_path (parent created), at model.sr, with
+    # one frame per model output sample.
     assert out.is_file()
-    assert rec["saved"] is not None
-    saved_path, _tensor, saved_rate = rec["saved"]
-    assert saved_path == str(out)
-    assert saved_rate == 24000
+    with wave.open(str(out), "rb") as written:
+        assert written.getnchannels() == 1
+        assert written.getsampwidth() == 2
+        assert written.getframerate() == 24000
+        assert written.getnframes() == 4
 
     # Param mapping onto the generate call.
     assert len(model.generate_calls) == 1
