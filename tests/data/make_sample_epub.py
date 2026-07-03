@@ -19,6 +19,7 @@ __all__ = [
     "make_epub_spine_order",
     "make_epub_heading_only_and_no_heading",
     "make_epub_unicode",
+    "make_epub_div_paragraphs",
 ]
 
 
@@ -307,6 +308,38 @@ def make_epub_blockquote(out_path: Path) -> Path:
         "<p>Before the quote.</p>"
         "<blockquote><p>QUOTED_PARAGRAPH_MARKER stands alone.</p></blockquote>"
         "<p>After the quote.</p>"
+    )
+    book.add_item(ch)
+
+    book.add_item(epub.EpubNcx())
+    book.add_item(epub.EpubNav())
+    book.spine = ["nav", ch]
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    epub.write_epub(str(out_path), book)
+    return out_path
+
+
+def make_epub_div_paragraphs(out_path: Path) -> Path:
+    """Write an EPUB whose paragraphs are ``<div class="...">`` (not ``<p>``).
+
+    Mirrors how Calibre / most commercial EPUBs are structured: an empty anchor ``<p>``, an
+    image wrapped in a container ``<div>``, a title ``<div>``, several text ``<div>``s, and a
+    nested container ``<div>`` around an inner text ``<div>``. The parser must extract each
+    leaf text div as a line, skip the image-only and container divs (via innermost-only
+    de-dup + empty-skip), and never duplicate the nested paragraph.
+    """
+    from ebooklib import epub
+
+    book = _new_book()
+    ch = epub.EpubHtml(title="Div Chapter", file_name="divs.xhtml", lang="en")
+    ch.content = (
+        '<p class="anchor"><a id="c1"></a></p>'  # empty anchor p -> skipped
+        '<div class="centerAligned"><img alt="x" src="x.jpg"/></div>'  # img only -> skipped
+        '<div class="fmhT"><b>The Case of the Div Paragraph</b></div>'  # title div -> a line
+        '<div class="fmtx">DIV_FIRST paragraph of prose.</div>'
+        '<div class="fmtx1">DIV_SECOND paragraph, with an <i>inline</i> emphasis.</div>'
+        '<div class="box"><div class="inner">DIV_NESTED stands alone.</div></div>'  # container
     )
     book.add_item(ch)
 

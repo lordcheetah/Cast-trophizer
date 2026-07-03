@@ -17,6 +17,7 @@ from casttrophizer.ebook.epub import EpubParser
 from casttrophizer.errors import EbookParseError
 from tests.data.make_sample_epub import (
     make_epub_blockquote,
+    make_epub_div_paragraphs,
     make_epub_heading_only_and_no_heading,
     make_epub_image_only_chapter,
     make_epub_no_toc,
@@ -109,6 +110,32 @@ def test_blockquote_dedup_no_duplicated_text(tmp_path: Path) -> None:
     quoted = [ln for ln in lines if "QUOTED_PARAGRAPH_MARKER" in ln]
     # The quoted paragraph appears exactly once (inner <p>), not twice (blockquote + p).
     assert len(quoted) == 1
+
+
+# --------------------------------------------------------------------------- #
+# <div>-based paragraphs (Calibre / most commercial EPUBs use <div>, not <p>)
+# --------------------------------------------------------------------------- #
+def test_div_paragraphs_are_extracted(tmp_path: Path) -> None:
+    """Paragraphs wrapped in ``<div class="...">`` (not ``<p>``) are extracted as lines.
+
+    Regression for real EPUBs (e.g. Calibre conversions) where prose lives in ``<div>``s.
+    Each leaf text div becomes one line; the image-only container div and the wrapping
+    container div are skipped/de-duplicated; the nested paragraph is not duplicated; and an
+    inline ``<i>`` is flattened into its paragraph's text.
+    """
+    book = _parse(make_epub_div_paragraphs(tmp_path / "divs.epub"))
+    lines = book.chapters[0].lines
+
+    # every leaf text div became exactly one line
+    for marker in ("DIV_FIRST", "DIV_SECOND", "DIV_NESTED"):
+        assert sum(marker in ln for ln in lines) == 1, f"{marker} not extracted exactly once"
+    # the title <div> is emitted as a spoken line
+    assert any("The Case of the Div Paragraph" in ln for ln in lines)
+    # inline <i> is flattened into the paragraph text (not a separate/empty line)
+    assert any("DIV_SECOND" in ln and "inline" in ln for ln in lines)
+    # the image-only container div produced no empty line, and nothing is blank/HTML
+    assert all(ln.strip() for ln in lines)
+    assert not any("<" in ln or ">" in ln for ln in lines)
 
 
 # --------------------------------------------------------------------------- #

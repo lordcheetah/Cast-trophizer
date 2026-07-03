@@ -7,9 +7,13 @@ Parse contract (see ``docs/plans/parse-stage.md``):
 
 * Reading order comes from the **spine** (the authoritative reading order); the ToC/nav
   is consulted only for chapter *titles*.
-* Each block-level element (``<p>``, ``<h1>``-``<h6>``, ``<li>``, ``<blockquote>``)
+* Each block-level element (``<p>``, ``<h1>``-``<h6>``, ``<li>``, ``<blockquote>``, ``<div>``)
   becomes one plain-text :class:`~casttrophizer.ebook.base.ParsedChapter` line, in
-  **document order**. The chapter heading is emitted as a normal line (so it is spoken)
+  **document order**. ``<div>`` is included because many real EPUBs (Calibre/most commercial
+  conversions) wrap every paragraph in a ``<div class="...">`` rather than a ``<p>``; the
+  innermost-only de-dup below keeps container ``<div>``s (which wrap other blocks) from being
+  emitted, and empty blocks (e.g. a ``<div>`` holding only an ``<img>``) are skipped.
+  The chapter heading is emitted as a normal line (so it is spoken)
   *and* reused as the chapter title. Because well-formed chapters open with their
   heading, that line is normally first; we deliberately do **not** reorder it ahead of
   any genuine pre-heading content (e.g. a part-opener epigraph), which would corrupt the
@@ -34,8 +38,10 @@ from casttrophizer.errors import EbookParseError
 
 __all__ = ["EpubParser"]
 
-#: Block-level elements that each become one line.
-_BLOCK_TAGS = ["p", "h1", "h2", "h3", "h4", "h5", "h6", "li", "blockquote"]
+#: Block-level elements that each become one line. ``div`` is included because many real
+#: EPUBs use ``<div class="...">`` for paragraphs (not ``<p>``); the innermost-only de-dup
+#: keeps container divs from being emitted and empty blocks are skipped.
+_BLOCK_TAGS = ["p", "h1", "h2", "h3", "h4", "h5", "h6", "li", "blockquote", "div"]
 #: Heading tags used to derive a chapter title and the leading spoken line.
 _HEADING_TAGS = ["h1", "h2", "h3", "h4", "h5", "h6"]
 #: CSS selectors for note bodies that are dropped entirely (not spoken).
