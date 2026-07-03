@@ -12,6 +12,8 @@ __all__ = [
     "make_sample_epub",
     "make_epub_no_toc",
     "make_epub_image_only_chapter",
+    "make_epub_image_only",
+    "make_epub_text_with_empty_chapter",
     "make_epub_with_footnote",
     "make_epub_blockquote",
     "make_epub_spine_order",
@@ -120,6 +122,62 @@ def make_epub_image_only_chapter(out_path: Path) -> Path:
     book.add_item(epub.EpubNcx())
     book.add_item(epub.EpubNav())
     book.spine = ["nav", ch]
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    epub.write_epub(str(out_path), book)
+    return out_path
+
+
+def make_epub_image_only(out_path: Path) -> Path:
+    """Write a 2-chapter EPUB whose every content document is image-only (no text anywhere).
+
+    Models a scanned/OCR-less book: each chapter body is just ``<p><img/></p>`` (plus an
+    ``<svg>`` placeholder), so the whole book yields **zero** readable lines. The parse stage
+    must fail this as unusable rather than silently succeed with empty chapters.
+    """
+    from ebooklib import epub
+
+    book = _new_book()
+    bodies = [
+        '<p><img src="scan-1.png" alt=""/></p>',
+        '<p><img src="scan-2.png" alt=""/></p><svg xmlns="http://www.w3.org/2000/svg"></svg>',
+    ]
+    chapters = []
+    for i, html in enumerate(bodies, start=1):
+        ch = epub.EpubHtml(title=f"Plate {i}", file_name=f"scan_{i}.xhtml", lang="en")
+        ch.content = html
+        book.add_item(ch)
+        chapters.append(ch)
+
+    book.add_item(epub.EpubNcx())
+    book.add_item(epub.EpubNav())
+    book.spine = ["nav", *chapters]
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    epub.write_epub(str(out_path), book)
+    return out_path
+
+
+def make_epub_text_with_empty_chapter(out_path: Path) -> Path:
+    """Write a 2-chapter EPUB: one normal text chapter + one image-only (empty) chapter.
+
+    Proves the whole-book no-text guard is book-level, not chapter-level: a legitimate text
+    book with a single image-only chapter (a plate/illustration) must still parse cleanly,
+    the empty chapter surviving with ``lines == []``.
+    """
+    from ebooklib import epub
+
+    book = _new_book()
+    text_ch = epub.EpubHtml(title="Chapter One", file_name="chap_1.xhtml", lang="en")
+    text_ch.content = "<h1>Chapter One</h1><p>The narrator set the scene.</p>"
+    plate_ch = epub.EpubHtml(title="Plate", file_name="plate.xhtml", lang="en")
+    plate_ch.content = '<p><img src="plate.png" alt=""/></p>'
+    for ch in (text_ch, plate_ch):
+        book.add_item(ch)
+
+    book.add_item(epub.EpubNcx())
+    book.add_item(epub.EpubNav())
+    book.spine = ["nav", text_ch, plate_ch]
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     epub.write_epub(str(out_path), book)

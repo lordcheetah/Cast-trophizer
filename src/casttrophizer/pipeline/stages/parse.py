@@ -75,6 +75,18 @@ class ParseStage(Stage):
             chapters.append(Chapter(id=chapter_id, order=pch.order, title=pch.title, lines=lines))
             ctx.progress.advance(1, message=pch.title)
 
+        # Whole-book no-text guard: a single image-only chapter is legitimate (assemble
+        # handles empty chapters), but if *nothing* anywhere yielded a readable line the book
+        # is unusable — fail here with an actionable message instead of a confusing downstream
+        # "no TTS provider configured". Status stays unset so a fixed input can re-run.
+        if sum(len(chapter.lines) for chapter in chapters) == 0:
+            return StageResult(
+                self.name,
+                ReviewStatus.FAILED,
+                f"no readable text found in {src.name} — it may be an image-only or "
+                "scanned EPUB (OCR is not supported)",
+            )
+
         # Update metadata in place, preserving the read-only source path.
         project.book.title = parsed.title or project.book.title
         project.book.author = parsed.author or project.book.author

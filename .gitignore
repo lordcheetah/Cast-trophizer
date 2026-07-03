@@ -24,6 +24,15 @@ htmlcov/
 workspaces/
 # Smoke-test / scratch workspaces (scripts/smoke_test.py --workdir)
 .smoke-out/
+# castrun default workdir "." dumps these into the repo root — ignore stray copies
+/project.json
+/audio/
+/output/
+/logs/
+# Local input assets (voice clips, cover images, source books)
+/voices/
+/covers/
+/books/
 
 # Editors / OS
 .idea/

@@ -20,6 +20,10 @@ from casttrophizer.pipeline.stage import StageContext
 from casttrophizer.pipeline.stages.parse import ParseStage
 from casttrophizer.workspace.layout import WorkspaceLayout
 from casttrophizer.workspace.store import WorkspaceStore
+from tests.data.make_sample_epub import (
+    make_epub_image_only,
+    make_epub_text_with_empty_chapter,
+)
 from tests.fakes import RecordingProgressReporter
 
 
@@ -171,6 +175,48 @@ def test_failure_path_returns_failed_and_leaves_status_unset(
     assert result.status == ReviewStatus.FAILED
     # Status left unset so a fixed input can re-run.
     assert str(StageName.PARSE) not in parse_ready_project.stage_status
+
+
+def test_no_readable_text_anywhere_fails_and_leaves_status_unset(
+    tmp_workspace: WorkspaceStore, parse_ready_project: Project, tmp_path: Path
+) -> None:
+    """An image-only book (zero lines across all chapters) FAILs with an actionable message.
+
+    Status stays unset so a fixed input can re-run; the failure lands here at parse rather
+    than as a confusing downstream "no TTS provider configured".
+    """
+    image_only = make_epub_image_only(tmp_path / "inputs" / "image_only.epub")
+    parse_ready_project.book.source_ebook_path = str(image_only)
+    tmp_workspace.save(parse_ready_project)
+
+    result = ParseStage().run(parse_ready_project, _ctx(tmp_workspace, RecordingProgressReporter()))
+
+    assert result.status == ReviewStatus.FAILED
+    assert "no readable text" in result.message
+    assert "image_only.epub" in result.message
+    # status left unset (re-runnable) both in memory and on disk
+    assert str(StageName.PARSE) not in parse_ready_project.stage_status
+    assert ParseStage().is_complete(tmp_workspace.load()) is False
+
+
+def test_one_empty_chapter_among_nonempty_still_succeeds(
+    tmp_workspace: WorkspaceStore, parse_ready_project: Project, tmp_path: Path
+) -> None:
+    """A text book with a single image-only (empty) chapter parses cleanly — the guard is
+    whole-book, not per-chapter. The empty chapter survives with ``lines == []``."""
+    mixed = make_epub_text_with_empty_chapter(tmp_path / "inputs" / "mixed.epub")
+    parse_ready_project.book.source_ebook_path = str(mixed)
+    tmp_workspace.save(parse_ready_project)
+
+    result = ParseStage().run(parse_ready_project, _ctx(tmp_workspace, RecordingProgressReporter()))
+
+    assert result.status == ReviewStatus.COMPLETED
+    reloaded = tmp_workspace.load()
+    line_counts = [len(ch.lines) for ch in reloaded.book.chapters]
+    # one empty chapter (0 lines) coexists with at least one non-empty chapter
+    assert 0 in line_counts
+    assert any(count > 0 for count in line_counts)
+    assert ParseStage().is_complete(reloaded) is True
 
 
 def test_progress_reports_total_and_one_advance_per_chapter(

@@ -1,18 +1,27 @@
-"""Provider-need gating + ``--auto-accept`` invariants for the CLI runner.
+"""Provider-construction + ``--auto-accept`` invariants for the CLI runner.
 
-These are the deviation-sensitive guarantees from the plan (§`_run_once` provider gating and
-§`_auto_accept`), verified empirically by driving ``cli.main(argv)`` with **spy** provider
-factories injected through :class:`~casttrophizer.cli.CliDeps`:
+The CLI **always** constructs both providers and injects them into the ``StageContext`` (so
+no stage is ever reached without one — ``Pipeline.run`` advances through several stages in
+one call). Construction is cheap: it imports no heavy SDK (``torch``/``anthropic`` load
+lazily inside the provider methods), so the real invariant is not "was the factory called"
+but "was the provider actually *used*". These tests drive ``cli.main(argv)`` with **spy**
+factories injected through :class:`~casttrophizer.cli.CliDeps` and assert:
 
-* an LLM is built **only** while attribution is still pending;
-* a TTS provider is built **only** once the review gate is actually reachable (so the
-  halt-at-review run never constructs one);
+* on a halt-at-review run the TTS provider is built but its ``synthesize`` is never called
+  (the review gate is never passed);
+* once attribution is COMPLETED the LLM is built but its ``attribute_speakers`` is never
+  called, and the run does not demand an LLM key;
 * ``--auto-accept`` approves NEEDS_REVIEW attributions and rejects PENDING text suggestions
   (text left as-is) **without** assigning voices — so it must still halt at review when a
   speaker is unvoiced (criterion 3), never silently complete;
-* an idempotent re-run of a COMPLETED project builds no providers at all.
+* an idempotent re-run of a COMPLETED project uses no provider (built but never invoked).
 
-All fakes are offline/deterministic; no real API/model/ffmpeg is ever touched.
+The module-import cheapness (importing ``casttrophizer.cli`` pulls in no
+``torch``/``anthropic``/``chatterbox``) is asserted by the subprocess
+``tests/cli/test_cli_import.py``. That the *real* provider constructors are themselves cheap
+(so always-building them on a run stays lazy) was confirmed empirically — their ``__init__``
+imports nothing heavy and ``is_available`` uses env-var/``find_spec`` checks only. All fakes
+here are offline/deterministic; no real API/model/ffmpeg is ever touched.
 """
 
 from __future__ import annotations
@@ -35,15 +44,20 @@ from tests.fakes import FakeLLMProvider, FakeM4BAssembler, FakeTTSProvider
 
 
 class _Spy:
-    """A counting provider factory: records how many times the CLI built the provider."""
+    """A counting provider factory: records how many times the CLI built the provider.
+
+    ``provider`` is the single fake instance handed back on every call, so a test can inspect
+    it after the run (e.g. ``synthesize_calls`` / ``attribute_calls``) to prove the provider
+    was built-but-unused vs. actually invoked.
+    """
 
     def __init__(self, provider: object) -> None:
-        self._provider = provider
+        self.provider = provider
         self.calls = 0
 
     def __call__(self, config: AppConfig) -> object:
         self.calls += 1
-        return self._provider
+        return self.provider
 
 
 def _spy_llm() -> _Spy:
@@ -115,10 +129,10 @@ def test_auto_accept_before_voices_still_halts_and_resolves_criteria_1_and_2(
     # criteria 1 & 2 are cleared, so the "re-run with --auto-accept" hint is gone
     assert "re-run with `--auto-accept`" not in out
 
-    # attribution was COMPLETED, so no LLM was ever built; review never became reachable,
-    # so no TTS was ever built either.
-    assert llm.calls == 0
-    assert tts.calls == 0
+    # both providers are built (cheap), but neither is *used*: attribution was already
+    # COMPLETED (LLM never invoked) and review never passed (TTS never invoked).
+    assert llm.provider.attribute_calls == []
+    assert tts.provider.synthesize_calls == []
 
     after = WorkspaceStore.for_dir(wd).load()
     # criterion 1: the low-confidence Bob attribution became APPROVED via the real service
@@ -163,9 +177,10 @@ def test_auto_accept_completes_only_after_the_unvoiced_speaker_is_voiced(
 
     assert rc == 0
     assert "output:" in capsys.readouterr().out
-    # attribution already COMPLETED -> LLM never built; synthesize was reached -> TTS built once
-    assert llm.calls == 0
-    assert tts.calls == 1
+    # attribution already COMPLETED -> LLM built but never invoked; synthesize was reached ->
+    # the TTS provider was actually used.
+    assert llm.provider.attribute_calls == []
+    assert tts.provider.synthesize_calls != []
     assert len(assembler.requests) == 1
 
     project = WorkspaceStore.for_dir(wd).load()
@@ -176,17 +191,17 @@ def test_auto_accept_completes_only_after_the_unvoiced_speaker_is_voiced(
 # --------------------------------------------------------------------------- #
 # §3 provider-need gating
 # --------------------------------------------------------------------------- #
-def test_tts_factory_not_called_on_halt_at_review_run(
+def test_halt_at_review_run_builds_tts_but_never_uses_it(
     tmp_path: Path,
     sample_epub: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """The first `run` (parse->correct->attribute, halts at review) must not build TTS.
+    """The first `run` (parse->correct->attribute, halts at review) builds TTS but never uses it.
 
-    Synthesis is only reachable past the gate, so the TTS factory stays untouched — this is
-    what lets the review flow run without the ``tts`` extra / ffmpeg installed. Regression
-    guard for the fresh-project vacuous-``is_review_complete`` gating defect: synthesize is
-    gated on attribution being COMPLETED, not on the emptiness of a not-yet-parsed project.
+    Both providers are constructed up front (cheap, no heavy import), but synthesis is only
+    reachable past the gate, so the TTS provider's ``synthesize`` is never invoked — this is
+    what lets the review flow run without the ``tts`` extra / ffmpeg installed. The LLM, by
+    contrast, is actually used because attribution runs this pass.
     """
     wd = tmp_path / "ws"
     llm, tts = _spy_llm(), _spy_tts()
@@ -198,45 +213,75 @@ def test_tts_factory_not_called_on_halt_at_review_run(
     rc = _run(wd, "run", deps=deps)
 
     assert rc == 3
-    assert llm.calls == 1  # attribution pending -> LLM built exactly once
-    assert tts.calls == 0  # review not reached -> TTS must not be built
+    assert llm.provider.attribute_calls != []  # attribution ran this pass -> LLM used
+    assert tts.provider.synthesize_calls == []  # review not reached -> TTS built but unused
 
 
-def test_attribute_complete_run_does_not_build_llm(
+def test_attribute_complete_run_does_not_demand_llm_key(
     review_ready_project: Project,
     fake_voice_clips: list[Path],
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """Once attribution is COMPLETED, `run` must not demand an LLM (no key, no build).
+    """Once attribution is COMPLETED, `run` must not demand an LLM key.
 
-    Uses a fresh project whose attribution is already done; the LLM factory would raise if the
-    CLI tried to build it, proving the gate never reaches for a provider it does not need.
+    The LLM is still constructed (cheap) and injected, but because attribution is already
+    done the key preflight is skipped and its ``attribute_speakers`` is never invoked — so an
+    *unavailable* LLM (no ``ANTHROPIC_API_KEY``) does not block the run from completing.
     """
     wd = Path(review_ready_project.workspace_dir)
     clip = str(fake_voice_clips[0])
 
-    def _boom_llm(config: AppConfig) -> LLMProvider:
-        raise AssertionError("LLM must not be built once attribution is COMPLETED")
-
+    # An LLM with no key available: the run must still complete (preflight skipped, unused).
+    llm = _Spy(FakeLLMProvider(available=False))
     tts = _spy_tts()
-    deps = build_deps(llm_factory=_boom_llm, tts_factory=tts, assembler=FakeM4BAssembler())
+    deps = build_deps(llm_factory=llm, tts_factory=tts, assembler=FakeM4BAssembler())
 
     assert _run(wd, "assign-voice", "Bob", clip, deps=deps) == 0
     capsys.readouterr()
 
-    # completes without ever constructing the LLM (would raise) — synthesize builds TTS once
     rc = _run(wd, "run", "--auto-accept", deps=deps)
     assert rc == 0
-    assert tts.calls == 1
+    # the LLM was built but never invoked; synthesize was reached, so the TTS was used
+    assert llm.provider.attribute_calls == []
+    assert tts.provider.synthesize_calls != []
 
 
-def test_idempotent_rerun_of_complete_project_builds_no_providers(
+def test_run_until_parse_needs_no_llm_key(
+    tmp_path: Path,
+    sample_epub: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """`run --until parse` must not demand an LLM key — attribute never runs this pass.
+
+    The key preflight is gated on the attribute stage being *reachable* given ``--until``, so
+    stopping before attribute (to review OCR/text) works with no ``ANTHROPIC_API_KEY``.
+    """
+    wd = tmp_path / "ws"
+    llm = _Spy(FakeLLMProvider(available=False))  # no key configured
+    deps = build_deps(llm_factory=llm, tts_factory=_spy_tts(), assembler=FakeM4BAssembler())
+
+    assert _run(wd, "new", "--epub", str(sample_epub), deps=deps) == 0
+    capsys.readouterr()
+
+    rc = _run(wd, "run", "--until", "parse", deps=deps)
+    out = capsys.readouterr().out.lower()
+    assert rc != 2  # NOT blocked by the LLM-key preflight (exit 2)
+    assert "anthropic_api_key" not in out  # preflight message never shown
+    assert llm.provider.attribute_calls == []  # LLM built but never invoked
+    assert "stopped after parse" in out  # parse ran; pass stopped before attribute
+
+
+def test_idempotent_rerun_of_complete_project_uses_no_providers(
     tmp_path: Path,
     sample_epub: Path,
     fake_voice_clips: list[Path],
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """A re-run of a COMPLETED project is a no-op (exit 0) and constructs no providers."""
+    """A re-run of a COMPLETED project is a no-op (exit 0): providers are built but unused.
+
+    Every stage is already complete, so ``Pipeline.run`` skips them all — the constructed
+    providers are never invoked and no assembly happens.
+    """
     wd = tmp_path / "ws"
     clip = str(fake_voice_clips[0])
 
@@ -249,7 +294,7 @@ def test_idempotent_rerun_of_complete_project_builds_no_providers(
     assert _run(wd, "run", "--auto-accept", deps=build) == 0
     capsys.readouterr()
 
-    # now re-run with spies: nothing is pending, so no provider is built and no assembly happens
+    # now re-run with spies: nothing is pending, so neither provider is invoked and no assembly
     llm, tts = _spy_llm(), _spy_tts()
     assembler = FakeM4BAssembler()
     rerun = _deps_with_spies(llm=llm, tts=tts, assembler=assembler)
@@ -257,6 +302,6 @@ def test_idempotent_rerun_of_complete_project_builds_no_providers(
 
     assert rc == 0
     assert "complete" in capsys.readouterr().out
-    assert llm.calls == 0
-    assert tts.calls == 0
+    assert llm.provider.attribute_calls == []
+    assert tts.provider.synthesize_calls == []
     assert assembler.requests == []

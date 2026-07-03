@@ -10,7 +10,8 @@ from casttrophizer import cli
 from casttrophizer.domain.enums import StageName
 from casttrophizer.workspace.store import WorkspaceStore
 from tests.cli.conftest import build_deps
-from tests.fakes import FakeLLMProvider, FakeM4BAssembler
+from tests.data.make_sample_epub import make_epub_image_only
+from tests.fakes import FakeLLMProvider, FakeM4BAssembler, FakeTTSProvider
 
 
 def _new_and_attribute(wd: Path, sample_epub: Path) -> None:
@@ -101,18 +102,21 @@ def test_run_synthesize_without_tts_extra(
     fake_voice_clips: list[Path],
     capsys: pytest.CaptureFixture[str],
 ) -> None:
+    """An unavailable TTS provider (tts extra missing) FAILs at the synthesize stage guard.
+
+    The CLI no longer preflights the tts extra: the provider is built (cheap, no import), then
+    SynthesizeStage's own guard returns FAILED "TTS provider ... unavailable" (exit 1),
+    reported to stdout — not an exit-2 preflight.
+    """
     wd = tmp_path / "ws"
     _new_and_attribute(wd, sample_epub)
     _assign_all_voices(wd, str(fake_voice_clips[0]))
     capsys.readouterr()
 
-    def _raise_import(cfg: object) -> object:
-        raise ImportError("chatterbox not installed")
-
-    deps = build_deps(tts_factory=_raise_import)
+    deps = build_deps(tts_factory=lambda cfg: FakeTTSProvider(available=False))
     rc = cli.main(["--workdir", str(wd), "run", "--auto-accept"], deps=deps)
-    assert rc == 2
-    assert "tts extra" in capsys.readouterr().err
+    assert rc == 1
+    assert "unavailable" in capsys.readouterr().out
 
 
 def test_run_assemble_without_ffmpeg(
@@ -121,6 +125,11 @@ def test_run_assemble_without_ffmpeg(
     fake_voice_clips: list[Path],
     capsys: pytest.CaptureFixture[str],
 ) -> None:
+    """A missing ffmpeg FAILs at the assemble stage guard (exit 1), not an exit-2 preflight.
+
+    The CLI no longer preflights ffmpeg: synthesize completes, then AssembleStage's guard
+    returns FAILED "ffmpeg not found on PATH ..." reported to stdout.
+    """
     wd = tmp_path / "ws"
     _new_and_attribute(wd, sample_epub)
     _assign_all_voices(wd, str(fake_voice_clips[0]))
@@ -128,8 +137,35 @@ def test_run_assemble_without_ffmpeg(
 
     deps = build_deps(assembler=FakeM4BAssembler(available=False))
     rc = cli.main(["--workdir", str(wd), "run", "--auto-accept"], deps=deps)
-    assert rc == 2
-    assert "ffmpeg" in capsys.readouterr().err
+    assert rc == 1
+    assert "ffmpeg" in capsys.readouterr().out
+
+
+def test_run_image_only_epub_fails_at_parse_not_downstream(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A+B regression: an image-only EPUB fails at parse (exit 1), never reaching synthesize.
+
+    Before the fix, parse silently succeeded with zero lines and the vacuous review passed
+    straight into synthesize, which failed with the confusing "no TTS provider configured".
+    Now parse's whole-book no-text guard FAILs first with an actionable message.
+    """
+    wd = tmp_path / "ws"
+    epub = make_epub_image_only(tmp_path / "inputs" / "scan.epub")
+    deps = build_deps()
+    assert cli.main(["--workdir", str(wd), "new", "--epub", str(epub)], deps=deps) == 0
+    capsys.readouterr()
+
+    rc = cli.main(["--workdir", str(wd), "run"], deps=deps)
+
+    assert rc == 1
+    out = capsys.readouterr().out
+    assert "no readable text" in out
+    # never reached synthesize -> the old confusing downstream error must be absent
+    assert "no TTS provider configured" not in out
+    # parse status stays unset so a fixed input can re-run
+    project = WorkspaceStore.for_dir(wd).load()
+    assert str(StageName.PARSE) not in project.stage_status
 
 
 def test_assign_voice_bad_clip_path(

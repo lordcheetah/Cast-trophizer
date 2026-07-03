@@ -18,10 +18,11 @@ Command surface::
     assign-voice  SPEAKER CLIP        # SPEAKER = list index (int) or name (case-insensitive)
 
 Import discipline: this module is Qt-free and import-cheap. It never imports ``PySide6``,
-``torch``, ``anthropic``, ``openai``, or ``chatterbox`` at module load — providers are built
-lazily, only when a stage actually needs them (an LLM iff attribution is still pending; TTS +
-ffmpeg iff the review gate has passed). Providers/assembler reach the CLI through
-:class:`CliDeps` so tests inject offline fakes.
+``torch``, ``anthropic``, ``openai``, or ``chatterbox`` at module load. Both providers are
+constructed on every ``run`` and injected into the :class:`StageContext`, but construction
+is cheap — the heavy SDKs (``torch``/``anthropic``) load lazily inside the provider methods,
+so they are only imported if a stage (synthesize/attribute) actually calls the provider.
+Providers/assembler reach the CLI through :class:`CliDeps` so tests inject offline fakes.
 """
 
 from __future__ import annotations
@@ -60,7 +61,7 @@ from casttrophizer.providers import (
     build_tts_provider,
 )
 from casttrophizer.review import actions
-from casttrophizer.review.gate import describe_blockers, is_review_complete, review_blockers
+from casttrophizer.review.gate import describe_blockers, review_blockers
 from casttrophizer.review.service import ReviewService
 from casttrophizer.workspace.store import WorkspaceStore
 
@@ -72,7 +73,9 @@ __all__ = ["main", "CliDeps", "PrintReporter"]
 # Process exit codes (mirrors the stages' own fail-fast guards).
 _EXIT_OK = 0
 _EXIT_ERROR = 1  # generic/domain error, or a stage returning FAILED
-_EXIT_PRECONDITION = 2  # provider/config preflight failed (no LLM / no tts extra / no ffmpeg)
+_EXIT_PRECONDITION = 2  # LLM key preflight / provider-config error before the pipeline runs.
+# NOTE: the tts-extra and ffmpeg preflights were removed — their unavailability now surfaces
+# as a stage FAILED (exit 1) via the stages' own guards, not as an exit-2 preflight.
 _EXIT_NEEDS_REVIEW = 3  # the run halted at the review gate
 _EXIT_STOPPED = 4  # a cooperative stop was requested (Ctrl-C)
 
@@ -262,16 +265,26 @@ def _resolve_speaker(project: Project, token: str) -> Speaker:
 
 
 # --------------------------------------------------------------------------- #
-# provider construction (lazy, with fail-fast preflights)
+# provider construction (always built + injected; only the LLM key is preflighted)
 # --------------------------------------------------------------------------- #
-def _build_llm(deps: CliDeps, config: AppConfig, provider: str | None) -> LLMProvider:
-    """Build + preflight the LLM used for attribution (front-runs the stage's own guard)."""
+def _build_llm(
+    deps: CliDeps, config: AppConfig, provider: str | None, *, preflight: bool
+) -> LLMProvider:
+    """Build the LLM provider, optionally front-running the attribute stage's own guard.
+
+    Construction is cheap (no ``anthropic`` import — that stays lazy inside the provider's
+    methods), so the provider is always built and injected. When ``preflight`` is set (i.e.
+    attribution is still pending, so the attribute stage *will* run this pass), an
+    unavailable provider fails fast with a clear "set your key" message before any stage
+    runs, instead of a mid-stage FAILED. A completed attribution skips the preflight — a
+    finished project needs no LLM key.
+    """
     cfg = replace(config, llm_provider=provider) if provider else config
     try:
         llm = deps.llm_factory(cfg)
     except ConfigError as exc:
         raise CliError(str(exc), code=_EXIT_PRECONDITION) from exc
-    if not llm.is_available():
+    if preflight and not llm.is_available():
         raise CliError(
             "attribution needs an LLM: set ANTHROPIC_API_KEY "
             "(or use `--provider lmstudio` with LM Studio running)",
@@ -281,30 +294,18 @@ def _build_llm(deps: CliDeps, config: AppConfig, provider: str | None) -> LLMPro
 
 
 def _build_tts(deps: CliDeps, config: AppConfig) -> TTSProvider:
-    """Build + preflight the TTS provider used for synthesis (only reached past the gate)."""
+    """Build the TTS provider so synthesize always has one when reached.
+
+    Construction is cheap (no ``torch``/``chatterbox`` import — those stay lazy inside the
+    provider's methods), so it is always built and injected. There is **no** pre-emptive
+    availability preflight: the SynthesizeStage guard returns FAILED ("TTS provider ...
+    unavailable") if the ``tts`` extra is missing, which the CLI reports. A ``ConfigError``
+    for a misconfigured provider name is still surfaced as a precondition failure.
+    """
     try:
-        tts = deps.tts_factory(config)
-    except ImportError as exc:
-        raise CliError(
-            'synthesis needs the tts extra: pip install -e ".[tts]"',
-            code=_EXIT_PRECONDITION,
-        ) from exc
+        return deps.tts_factory(config)
     except ConfigError as exc:
         raise CliError(str(exc), code=_EXIT_PRECONDITION) from exc
-    if not tts.is_available():
-        raise CliError(f"TTS provider {tts.name} unavailable", code=_EXIT_PRECONDITION)
-    return tts
-
-
-def _preflight_ffmpeg(deps: CliDeps) -> None:
-    """Fail fast if ffmpeg is missing before the (slow) synthesis work runs."""
-    assembler = deps.assembler
-    if assembler is None:
-        from casttrophizer.audio.assembler import M4BAssembler
-
-        assembler = M4BAssembler()
-    if not assembler.is_available():
-        raise CliError("assembly needs ffmpeg on PATH", code=_EXIT_PRECONDITION)
 
 
 # --------------------------------------------------------------------------- #
@@ -378,32 +379,34 @@ def _run_once(
     provider: str | None,
     until: StageName | None,
 ) -> StageResult:
-    """Compute which providers this run actually needs, build them, and run the pipeline.
+    """Build both providers, inject them, and run the pipeline.
 
-    Provider-need gating (so review can be reached without installing torch, and so a
-    completed attribution doesn't require an LLM key):
+    ``Pipeline.run`` advances through several stages in one call, so it can carry a
+    vacuously-satisfied review straight into synthesize. Deciding *statically* (before the
+    run) whether to build a provider therefore risks reaching a stage whose provider was
+    never built. Instead both providers are **always** built and injected — construction is
+    cheap (it imports no heavy SDK; ``torch``/``anthropic`` load lazily inside the provider
+    methods, only when synthesize/attribute actually run). The stages' own guards handle an
+    unavailable provider (SynthesizeStage -> FAILED "unavailable"; AssembleStage -> FAILED
+    "ffmpeg not found"), which the CLI reports.
 
-    * build the **LLM** iff attribution is still pending (it will run this pass);
-    * build **TTS** iff synthesize is actually reachable this pass — attribution must be
-      COMPLETED (so speakers exist and blockers are real, not the vacuous "no chapters yet"
-      of an unparsed project) AND the review gate has passed (already COMPLETED, or every
-      blocker is already clear) — and synthesize isn't done; synthesize is only reached
-      past the gate;
-    * preflight **ffmpeg** under the same synthesize-reachable condition, before the slow work.
+    The one fail-fast kept here is the **LLM key preflight**, and only while the attribute
+    stage will actually run this pass — i.e. attribution is still pending AND ``--until`` does
+    not stop before it. An unconfigured LLM fails early with a clear "set your key" message
+    instead of a mid-stage FAILED; a completed attribution (or a ``--until parse``/``correct``
+    run that never reaches attribute) needs no key, so the preflight is skipped.
     """
     project = store.load()
     by_name = {stage.name: stage for stage in pipeline.stages}
     attribute_done = by_name[StageName.ATTRIBUTE].is_complete(project)
-    synth_done = by_name[StageName.SYNTHESIZE].is_complete(project)
-    assemble_done = by_name[StageName.ASSEMBLE].is_complete(project)
-    synth_reachable = attribute_done and (
-        by_name[StageName.REVIEW].is_complete(project) or is_review_complete(project)
-    )
 
-    llm = None if attribute_done else _build_llm(deps, config, provider)
-    tts = _build_tts(deps, config) if (synth_reachable and not synth_done) else None
-    if synth_reachable and not assemble_done:
-        _preflight_ffmpeg(deps)
+    # The attribute stage only runs this pass if it isn't already done AND --until doesn't
+    # stop before it — so a `run --until parse` needs no LLM key.
+    order = [stage.name for stage in pipeline.stages]
+    attribute_reachable = until is None or order.index(until) >= order.index(StageName.ATTRIBUTE)
+
+    llm = _build_llm(deps, config, provider, preflight=not attribute_done and attribute_reachable)
+    tts = _build_tts(deps, config)
 
     ctx = StageContext(store=store, progress=progress, llm=llm, tts=tts, config=config)
     return pipeline.run(ctx, until=until)
