@@ -66,14 +66,20 @@ def _find_suggestion(line: Line, suggestion_id: str) -> TextSuggestion:
 
 
 def accept_suggestion(line: Line, suggestion_id: str) -> None:
-    """Apply a suggestion: ``line.text = suggestion.suggested``, status -> APPROVED.
+    """Apply a suggestion by replacing its ``original`` token with ``suggested`` in the line.
 
-    Mutates ``line.text`` only — ``line.segments`` are NOT re-derived (see module
-    docstring: text-edit propagation is deferred). Raises ``ValueError`` if the
-    suggestion id is not on the line.
+    A surfaced (PENDING) suggestion stores the specific TOKEN being corrected in
+    ``original``/``suggested`` (e.g. ``"narrarator"`` -> ``"narrator"``), NOT the whole line —
+    so we replace the first occurrence of ``original`` within ``line.text`` rather than
+    overwriting the whole line (which would drop the rest of the sentence). A whole-line
+    suggestion (``original`` == the full line) still works: replacing it swaps the line.
+
+    Mutates ``line.text`` only — ``line.segments`` are NOT re-derived (see module docstring:
+    text-edit propagation is deferred). Raises ``ValueError`` if the suggestion id is not on
+    the line.
     """
     suggestion = _find_suggestion(line, suggestion_id)
-    line.text = suggestion.suggested
+    line.text = line.text.replace(suggestion.original, suggestion.suggested, 1)
     suggestion.status = ReviewStatus.APPROVED
 
 
@@ -189,7 +195,9 @@ def register_voice_clip(project: Project, source_path: str | Path, label: str) -
     path = Path(source_path)
     if not path.is_file():
         raise ValueError(f"voice clip source path does not exist: {path}")
-    clip = VoiceClip(id=new_id("voice"), source_path=str(path), label=label)
+    # Store an ABSOLUTE path: a relative one would resolve against whatever CWD the app (or a
+    # resumed run / the future UI) happens to have later, and the clip would read as missing.
+    clip = VoiceClip(id=new_id("voice"), source_path=str(path.resolve()), label=label)
     project.voice_clips.append(clip)
     return clip
 

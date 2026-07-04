@@ -41,11 +41,13 @@ def test_accept_suggestion_persists(
     service = ReviewService(tmp_workspace, review_ready_project)
     line = review_ready_project.book.chapters[0].lines[1]  # the PENDING-suggestion line
     sug = line.suggestions[0]
+    before = line.text
     service.accept_suggestion(line, sug.id)
 
     reloaded = _reload(review_ready_project)
     rline = reloaded.book.chapters[0].lines[1]
-    assert rline.text == sug.suggested
+    # Targeted token replacement (not a whole-line overwrite), persisted.
+    assert rline.text == before.replace(sug.original, sug.suggested, 1)
     assert rline.suggestions[0].status == ReviewStatus.APPROVED
 
 

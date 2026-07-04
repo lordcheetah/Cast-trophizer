@@ -14,7 +14,8 @@ import pytest
 from casttrophizer.attribution.policy import ensure_narrator, resolve_speaker
 from casttrophizer.audio.synthesize import unresolved_voices
 from casttrophizer.domain.enums import ReviewStatus, SpeakerRole
-from casttrophizer.domain.models import Line, Project, Segment, Speaker
+from casttrophizer.domain.ids import new_id
+from casttrophizer.domain.models import Line, Project, Segment, Speaker, TextSuggestion
 from casttrophizer.review import actions
 from casttrophizer.workspace.audio_cache import AudioCache
 
@@ -43,9 +44,52 @@ def _speaker(project: Project, name: str) -> Speaker:
 def test_accept_suggestion_applies_text_and_approves(review_ready_project: Project) -> None:
     line = _first_line(review_ready_project)
     suggestion = line.suggestions[0]
+    before = line.text
     actions.accept_suggestion(line, suggestion.id)
-    assert line.text == suggestion.suggested
+    # Targeted first-occurrence replacement of the token, NOT a whole-line overwrite.
+    assert line.text == before.replace(suggestion.original, suggestion.suggested, 1)
     assert suggestion.status == ReviewStatus.APPROVED
+
+
+def test_accept_suggestion_replaces_token_not_whole_line() -> None:
+    """A token-level suggestion must not overwrite the whole line (regression).
+
+    A PENDING spellcheck/OCR suggestion stores just the TOKEN in original/suggested (e.g.
+    'narrarator' -> 'narrator'). Accepting it must fix that token in place and preserve the
+    rest of the sentence, not collapse the line to the token.
+    """
+    line = Line(id=new_id("ln"), chapter_id="c", order=1, text="The narrarator spoke softly.")
+    line.suggestions.append(
+        TextSuggestion(
+            id=new_id("sug"),
+            original="narrarator",
+            suggested="narrator",
+            reason="spellcheck",
+            confidence=0.7,
+            status=ReviewStatus.PENDING,
+        )
+    )
+    actions.accept_suggestion(line, line.suggestions[0].id)
+    assert line.text == "The narrator spoke softly."
+    assert line.suggestions[0].status == ReviewStatus.APPROVED
+
+
+def test_register_voice_clip_stores_absolute_path(
+    review_ready_project: Project, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A relative clip path is stored ABSOLUTE so it resolves from any CWD (regression).
+
+    A relative ``source_path`` would resolve against whatever CWD a later/resumed run has,
+    reading the clip as missing.
+    """
+    clip = tmp_path / "voices" / "narr.wav"
+    clip.parent.mkdir(parents=True)
+    clip.write_bytes(b"WAV")
+    monkeypatch.chdir(tmp_path)
+
+    vc = actions.register_voice_clip(review_ready_project, Path("voices") / "narr.wav", "narrator")
+    assert Path(vc.source_path).is_absolute()
+    assert Path(vc.source_path) == clip.resolve()
 
 
 def test_reject_suggestion_leaves_text(review_ready_project: Project) -> None:
