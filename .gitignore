@@ -33,6 +33,7 @@ workspaces/
 /voices/
 /covers/
 /books/
+/work/
 
 # Editors / OS
 .idea/
