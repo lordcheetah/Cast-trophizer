@@ -608,8 +608,9 @@ def _cmd_assign_voice_rest(
     """Bulk-assign category default clips to every referenced, still-unvoiced speaker.
 
     Targets exactly the speakers the review gate flags (``unresolved_speakers`` — shares the
-    synthesize precheck predicate, so the ``<unattributed>`` sentinel is excluded: ``--rest``
-    cannot fix a speaker-less segment). Validates full coverage up front — if any target's
+    synthesize precheck predicate). A renderable ``speaker_id=None`` segment resolves to the
+    reserved narrator, so an unvoiced narrator is a valid target here and ``--rest`` voices it.
+    Validates full coverage up front — if any target's
     category resolves to no clip, fails without assigning anything (never leaves a referenced
     speaker unvoiced, which would re-block the gate). Registers one shared ``VoiceClip`` per
     distinct path (validating each path exists) and persists all assignments in a single save.

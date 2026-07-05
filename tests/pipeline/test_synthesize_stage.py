@@ -17,9 +17,11 @@ from pathlib import Path
 import pytest
 
 from casttrophizer.audio.loudness import DEFAULT_PEAK_CEILING_DBFS, LoudnessSettings
+from casttrophizer.audio.synthesize import synthesize_chapter
 from casttrophizer.audio.wavfile import read_wav_mono_float
 from casttrophizer.domain.enums import ReviewStatus, SpeakerRole, StageName
-from casttrophizer.domain.models import Project, Segment, Speaker
+from casttrophizer.domain.ids import new_id
+from casttrophizer.domain.models import Project, Segment, Speaker, find_narrator
 from casttrophizer.pipeline.runner import Pipeline
 from casttrophizer.pipeline.stage import StageContext
 from casttrophizer.pipeline.stages.synthesize import SynthesizeStage
@@ -54,6 +56,13 @@ def _speaker(project: Project, sid: str | None) -> Speaker:
 def _voice_path(project: Project, segment: Segment) -> str:
     speaker = _speaker(project, segment.speaker_id)
     clip = next(c for c in project.voice_clips if c.id == speaker.voice_clip_id)
+    return clip.source_path
+
+
+def _narrator_clip_path(project: Project) -> str:
+    narrator = find_narrator(project)
+    assert narrator is not None
+    clip = next(c for c in project.voice_clips if c.id == narrator.voice_clip_id)
     return clip.source_path
 
 
@@ -127,6 +136,127 @@ def test_each_segment_rendered_with_its_speakers_voice(
         s for s in _renderable_segments(synthesize_ready_project) if s.role == SpeakerRole.CHARACTER
     )
     assert str(by_text[narration.text].voice_clip_path) != str(by_text[quote.text].voice_clip_path)
+
+
+def test_none_segment_renders_on_narrator_clip(
+    tmp_workspace: WorkspaceStore, synthesize_ready_project: Project
+) -> None:
+    """A renderable ``speaker_id=None`` segment resolves to the narrator and renders on its clip.
+
+    This is the headline proof for the ``<unattributed>`` fix: with the narrator voiced, a None
+    segment renders (no precheck block) using the *narrator's* voice_clip_path and ends COMPLETED.
+    """
+    project = synthesize_ready_project
+    project.book.chapters[0].lines[0].segments.append(
+        Segment(
+            id=new_id("seg"),
+            text="an orphan quote",
+            speaker_id=None,
+            role=SpeakerRole.NARRATOR,
+            confidence=0.0,
+            review_status=ReviewStatus.APPROVED,
+        )
+    )
+    tts = FakeTTSProvider()
+    result = SynthesizeStage().run(project, _ctx(tmp_workspace, RecordingProgressReporter(), tts))
+    assert result.status == ReviewStatus.COMPLETED
+
+    request = next(r for r in tts.synthesize_calls if r.text == "an orphan quote")
+    assert str(request.voice_clip_path) == _narrator_clip_path(project)
+
+    reloaded = tmp_workspace.load()
+    saved = next(s for s in _all_segments(reloaded) if s.text == "an orphan quote")
+    assert saved.audio_status == ReviewStatus.COMPLETED
+
+
+def test_none_segment_rerenders_when_narrator_voice_reassigned(
+    tmp_workspace: WorkspaceStore, synthesize_ready_project: Project
+) -> None:
+    """Reassigning the narrator's clip invalidates a None segment's cache key (BLOCKER guard).
+
+    A None segment renders on the narrator's clip A (key ``K_A``). If the user reassigns the
+    narrator to clip B, the cache key MUST change so the segment re-renders on B — otherwise it
+    is silently SKIPPED and keeps clip-A audio while explicit-narrator segments move to B. This
+    pins that the cache key resolves None -> narrator exactly like the render path does.
+    """
+    project = synthesize_ready_project
+    project.book.chapters[0].lines[0].segments.append(
+        Segment(
+            id=new_id("seg"),
+            text="an orphan quote",
+            speaker_id=None,
+            role=SpeakerRole.NARRATOR,
+            confidence=0.0,
+            review_status=ReviewStatus.APPROVED,
+        )
+    )
+    SynthesizeStage().run(
+        project, _ctx(tmp_workspace, RecordingProgressReporter(), FakeTTSProvider())
+    )
+    persisted = tmp_workspace.load()
+    orphan = next(s for s in _all_segments(persisted) if s.text == "an orphan quote")
+    key_a = orphan.audio_cache_key
+    assert key_a is not None and orphan.audio_status == ReviewStatus.COMPLETED
+
+    # Reassign the narrator to a different existing clip (clip B).
+    narrator = find_narrator(persisted)
+    assert narrator is not None
+    clip_b_id = next(c.id for c in persisted.voice_clips if c.id != narrator.voice_clip_id)
+    narrator.voice_clip_id = clip_b_id
+    tmp_workspace.save(persisted)
+
+    second_tts = FakeTTSProvider()
+    SynthesizeStage().run(persisted, _ctx(tmp_workspace, RecordingProgressReporter(), second_tts))
+
+    reloaded = tmp_workspace.load()
+    orphan_after = next(s for s in _all_segments(reloaded) if s.text == "an orphan quote")
+    assert orphan_after.audio_cache_key != key_a  # voice changed -> new key
+    assert orphan_after.audio_status == ReviewStatus.COMPLETED
+    # It re-rendered (was NOT skipped) on the NEW narrator clip.
+    rerendered = [r for r in second_tts.synthesize_calls if r.text == "an orphan quote"]
+    assert len(rerendered) == 1
+    assert str(rerendered[0].voice_clip_path) == _narrator_clip_path(reloaded)
+
+
+def test_synthesize_chapter_none_segment_without_narrator_fails_not_crashes(
+    tmp_workspace: WorkspaceStore, synthesize_ready_project: Project
+) -> None:
+    """Defensive: a None segment with no narrator to resolve to is flagged FAILED, never crashes.
+
+    Bypasses the ``unresolved_voices`` precheck (which would FAIL the stage naming ``narrator``)
+    by driving ``synthesize_chapter`` directly, so the per-segment flag-and-continue path is the
+    thing under test. Alice (voiced) still renders; the narrator-less None segments go FAILED.
+    """
+    project = synthesize_ready_project
+    project.speakers = [sp for sp in project.speakers if sp.role != SpeakerRole.NARRATOR]
+    for seg in _all_segments(project):
+        if seg.role == SpeakerRole.NARRATOR:
+            seg.speaker_id = None  # now a None segment with no narrator to resolve to
+    assert find_narrator(project) is None
+
+    cache = AudioCache(tmp_workspace.layout)
+    speakers = {sp.id: sp for sp in project.speakers}
+    voices = {vc.id: vc for vc in project.voice_clips}
+    rendered, failed, stopped = synthesize_chapter(
+        project.book.chapters[0],
+        project,
+        FakeTTSProvider(),
+        cache,
+        speakers=speakers,
+        voices=voices,
+        advance=lambda message: None,
+        should_stop=lambda: False,
+        save=lambda: None,
+    )
+    assert (rendered, failed, stopped) == (True, True, False)  # Alice ok, None segments failed
+    orphans = [
+        s
+        for ln in project.book.chapters[0].lines
+        for s in ln.segments
+        if s.speaker_id is None and s.text.strip()
+    ]
+    assert orphans
+    assert all(s.audio_status == ReviewStatus.FAILED for s in orphans)
 
 
 def test_tts_params_passed_match_cache_key_input(

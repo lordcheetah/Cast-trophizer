@@ -131,11 +131,12 @@ def set_segment_speaker(
 ) -> None:
     """Override the attribution: point ``segment`` at ``speaker_id`` + ``role``.
 
-    ``speaker_id`` of ``None`` leaves the segment **unattributed** (``segment.speaker_id =
-    None``) — it does NOT mean narrator; to assign the narrator, pass the narrator speaker's
-    id. A non-None id must already exist in ``project.speakers`` (raises ``ValueError``
-    otherwise). By default the human's choice marks ``review_status`` APPROVED; pass
-    ``approve=False`` to leave the status untouched (note: this neither approves nor flags —
+    ``speaker_id`` of ``None`` stores ``segment.speaker_id = None``, which **renders as the
+    reserved narrator** at synthesis (see
+    :func:`~casttrophizer.domain.models.find_narrator`); to attribute a specific character,
+    pass that speaker's id. A non-None id must already exist in ``project.speakers`` (raises
+    ``ValueError`` otherwise). By default the human's choice marks ``review_status`` APPROVED;
+    pass ``approve=False`` to leave the status untouched (note: this neither approves nor flags —
     a still-``NEEDS_REVIEW`` segment keeps blocking the review gate).
 
     Cache consequence: changing the resolved speaker changes the segment's

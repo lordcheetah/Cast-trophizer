@@ -10,9 +10,12 @@ Two seams the stage drives:
 ``unresolved_voices(project)``
     The §2b fail-fast precheck. Returns the distinct **display names** of speakers that are
     referenced by some segment but have no usable voice clip (``voice_clip_id`` is None, the
-    referenced :class:`VoiceClip` is missing, or its ``source_path`` file does not exist).
-    The stage returns FAILED naming these before any TTS call, so a misconfigured project
-    fails instantly instead of half-rendering.
+    referenced :class:`VoiceClip` is missing, or its ``source_path`` file does not exist). A
+    segment with ``speaker_id=None`` resolves to the reserved narrator (see
+    :func:`~casttrophizer.domain.models.find_narrator`), so an unattributed-but-renderable
+    quote surfaces the *narrator* when the narrator is unvoiced — not a sentinel. The stage
+    returns FAILED naming these before any TTS call, so a misconfigured project fails instantly
+    instead of half-rendering.
 
 ``synthesize_chapter(...)``
     For each segment in a chapter: skip whitespace-only text; compute the cache key from live
@@ -33,7 +36,14 @@ from pathlib import Path
 
 from casttrophizer.audio.loudness import LoudnessSettings, normalize_wav_file
 from casttrophizer.domain.enums import ReviewStatus
-from casttrophizer.domain.models import Chapter, Project, Speaker, VoiceClip
+from casttrophizer.domain.models import (
+    Chapter,
+    Project,
+    Speaker,
+    VoiceClip,
+    find_narrator,
+    resolve_segment_speaker_id,
+)
 from casttrophizer.errors import TTSProviderError
 from casttrophizer.providers.base import SynthesisRequest, TTSProvider
 from casttrophizer.workspace.audio_cache import AudioCache
@@ -71,15 +81,23 @@ def _speaker_index(project: Project) -> dict[str, Speaker]:
 
 
 def _referenced_speaker_ids(project: Project) -> list[str]:
-    """Distinct speaker ids referenced by any non-whitespace segment, in first-seen order."""
+    """Distinct speaker ids referenced by any non-whitespace segment, in first-seen order.
+
+    A segment with ``speaker_id=None`` resolves to the reserved narrator, so it contributes
+    ``narrator.id`` here (letting the voice prechecks flag/target the narrator when unvoiced).
+    The contribution is skipped only when no narrator exists at all (defensive can't-happen
+    case) — those None segments have no resolvable Speaker id.
+    """
+    narrator = find_narrator(project)
     seen: dict[str, None] = {}
     for chapter in project.book.chapters:
         for line in chapter.lines:
             for segment in line.segments:
                 if not segment.text.strip():
                     continue  # whitespace-only segments are never rendered (§7)
-                if segment.speaker_id is not None and segment.speaker_id not in seen:
-                    seen[segment.speaker_id] = None
+                sid = resolve_segment_speaker_id(segment, narrator)
+                if sid is not None and sid not in seen:
+                    seen[sid] = None
     return list(seen)
 
 
@@ -111,8 +129,14 @@ def unresolved_voices(project: Project) -> list[str]:
     ``voice_clip_id`` is None, the referenced :class:`VoiceClip` is absent from
     ``project.voice_clips``, or its ``source_path`` file is missing on disk. Names are
     returned in first-referenced order, de-duplicated. An empty list means every referenced
-    speaker can be synthesized. A referenced segment with ``speaker_id`` of ``None`` is also
-    treated as unresolved (reported as ``"<unattributed>"``) since no voice can be resolved.
+    speaker can be synthesized. A renderable segment with ``speaker_id=None`` resolves to the
+    reserved narrator via :func:`_referenced_speaker_ids`, so an unvoiced narrator surfaces
+    here by name (``"narrator"``) — exactly the speaker ``assign-voice --rest`` can fix.
+
+    Defensive: if no narrator exists at all (a narrator-less project — shouldn't happen
+    post-attribution) yet a renderable None segment exists, that segment has no resolvable
+    Speaker, so the name ``"narrator"`` is reported directly to keep the message clear (never
+    ``<unattributed>``); ``synthesize_chapter`` then marks such a segment FAILED.
     """
     speakers = _speaker_index(project)
     voices = _voice_index(project)
@@ -125,9 +149,9 @@ def unresolved_voices(project: Project) -> list[str]:
             name = speaker.name if speaker is not None else speaker_id
             missing[name] = None
 
-    # A renderable segment with no speaker at all cannot resolve a voice either.
-    if _has_unattributed_renderable_segment(project):
-        missing.setdefault("<unattributed>", None)
+    # Defensive: a renderable None segment with no narrator to resolve to cannot be voiced.
+    if find_narrator(project) is None and _has_renderable_none_segment(project):
+        missing.setdefault("narrator", None)
 
     return list(missing)
 
@@ -142,9 +166,11 @@ def unresolved_speakers(project: Project) -> list[Speaker]:
     with :func:`unresolved_voices` so the two predicates cannot drift. First-referenced order,
     de-duplicated.
 
-    Unlike :func:`unresolved_voices`, this **excludes** the ``<unattributed>`` sentinel (a
-    renderable segment with ``speaker_id`` ``None`` has no Speaker to voice — ``--rest`` cannot
-    fix it) and any referenced id that resolves to no Speaker object.
+    Because ``_referenced_speaker_ids`` resolves ``speaker_id=None`` to the reserved narrator,
+    the narrator Speaker is included here when a renderable None segment exists and the narrator
+    is unvoiced — so ``--rest`` can voice it. The only ``None`` case ``--rest`` cannot fix is a
+    narrator-less project (no Speaker to target); that defensive gap is documented on
+    :func:`unresolved_voices`.
     """
     speakers = _speaker_index(project)
     voices = _voice_index(project)
@@ -160,7 +186,8 @@ def unresolved_speakers(project: Project) -> list[Speaker]:
     return out
 
 
-def _has_unattributed_renderable_segment(project: Project) -> bool:
+def _has_renderable_none_segment(project: Project) -> bool:
+    """True iff any renderable segment has ``speaker_id=None`` (resolves to the narrator)."""
     for chapter in project.book.chapters:
         for line in chapter.lines:
             for segment in line.segments:
@@ -201,6 +228,11 @@ def synthesize_chapter(
     failed_any = False
     processed = 0
 
+    # None segments resolve to the reserved narrator (looked up once). If no narrator exists
+    # (defensive can't-happen case) such a segment resolves to no clip and takes the
+    # flag-and-continue FAILED path below rather than crashing.
+    narrator = find_narrator(project)
+
     # Per-segment loudness normalization (confirmed decision): applied to each just-rendered
     # WAV. ``None`` => the project has no loudness block (older project) -> skip entirely.
     loudness = LoudnessSettings.from_params(project.tts_params)
@@ -225,10 +257,15 @@ def synthesize_chapter(
                 advance(None)  # cache hit: current key + existing file + rendered status
                 continue
 
-            speaker = speakers.get(segment.speaker_id) if segment.speaker_id else None
+            sid = resolve_segment_speaker_id(segment, narrator)
+            speaker = speakers.get(sid) if sid else None
             clip_path = _resolved_clip_path(speaker, voices)
             if clip_path is None:
-                # Voice vanished after the precheck (race): flag-and-continue.
+                # Voice vanished after the precheck (race), or a None segment has no narrator
+                # to resolve to (defensive): flag-and-continue. Clear any stale key so a FAILED
+                # segment never points at an old WAV the assemble stage might stitch in
+                # (symmetric with the TTSProviderError branch below).
+                segment.audio_cache_key = None
                 segment.audio_status = ReviewStatus.FAILED
                 failed_any = True
                 advance(line.text[:40] or None)

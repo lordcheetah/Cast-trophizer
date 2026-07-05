@@ -18,7 +18,12 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-from casttrophizer.domain.models import Project, Segment
+from casttrophizer.domain.models import (
+    Project,
+    Segment,
+    find_narrator,
+    resolve_segment_speaker_id,
+)
 from casttrophizer.workspace.layout import WorkspaceLayout
 
 __all__ = ["AudioCache"]
@@ -43,8 +48,9 @@ class AudioCache:
     ) -> str:
         """Compute the deterministic cache key for a segment's audio.
 
-        ``voice_clip_id`` may be ``None`` (narrator or not-yet-assigned voice); it is
-        folded into the hash as an empty string so the key is still stable.
+        ``voice_clip_id`` may be ``None`` (a speaker with no assigned voice, or a None
+        segment with no narrator to resolve to); it is folded into the hash as an empty
+        string so the key is still stable.
         """
         h = hashlib.sha256()
         h.update(segment_text.encode("utf-8"))
@@ -58,19 +64,23 @@ class AudioCache:
     def key_for(cls, segment: Segment, project: Project) -> str:
         """Compute the cache key for ``segment`` using ``project``'s global tts params.
 
-        The voice clip id is resolved from the segment's speaker. If the speaker (or its
-        voice assignment) is missing, the voice component is empty — the key stays
-        deterministic and will change once a voice is assigned.
+        The voice clip id is resolved from the segment's *effective* speaker — a
+        ``speaker_id=None`` segment resolves to the reserved narrator (the same rule the
+        render path uses, via :func:`resolve_segment_speaker_id`), so the key folds in the
+        exact voice that will render and changes when that voice is reassigned. If the
+        speaker (or its voice assignment) is missing, the voice component is empty — the key
+        stays deterministic and will change once a voice is assigned.
         """
         voice_clip_id = cls._voice_clip_id_for(segment, project)
         return cls.compute_key(segment.text, voice_clip_id, project.tts_params)
 
     @staticmethod
     def _voice_clip_id_for(segment: Segment, project: Project) -> str | None:
-        if segment.speaker_id is None:
+        sid = resolve_segment_speaker_id(segment, find_narrator(project))
+        if sid is None:
             return None
         for speaker in project.speakers:
-            if speaker.id == segment.speaker_id:
+            if speaker.id == sid:
                 return speaker.voice_clip_id
         return None
 

@@ -7,7 +7,9 @@ fixture (mixed blocker state) and the already-clean ``sample_project``.
 from __future__ import annotations
 
 from casttrophizer.audio.synthesize import unresolved_voices
-from casttrophizer.domain.models import Project, Segment, Speaker, TextSuggestion
+from casttrophizer.domain.enums import ReviewStatus, SpeakerRole
+from casttrophizer.domain.ids import new_id
+from casttrophizer.domain.models import Project, Segment, Speaker, TextSuggestion, find_narrator
 from casttrophizer.review import actions
 from casttrophizer.review.gate import (
     describe_blockers,
@@ -123,3 +125,30 @@ def test_describe_blockers_when_empty(sample_project: Project) -> None:
     blockers = review_blockers(sample_project)
     actions.approve_attribution(_segment(sample_project, blockers.needs_attribution[0]))
     assert describe_blockers(review_blockers(sample_project)) == "review complete"
+
+
+def test_unvoiced_narrator_with_none_segment_names_narrator(review_ready_project: Project) -> None:
+    """A renderable ``speaker_id=None`` segment + unvoiced narrator surfaces the narrator by name.
+
+    Proves the gate string is fixed: ``describe_blockers`` reports ``voices needed for:
+    narrator`` (never the old ``<unattributed>`` sentinel), so the run-gate hint and
+    ``assign-voice --rest`` can voice it.
+    """
+    project = review_ready_project
+    narrator = find_narrator(project)
+    assert narrator is not None
+    narrator.voice_clip_id = None  # narrator now unvoiced
+    project.book.chapters[0].lines[0].segments.append(
+        Segment(
+            id=new_id("seg"),
+            text="an orphan quote",
+            speaker_id=None,
+            role=SpeakerRole.NARRATOR,
+            confidence=0.0,
+            review_status=ReviewStatus.NEEDS_REVIEW,
+        )
+    )
+    text = describe_blockers(review_blockers(project))
+    assert "voices needed for:" in text
+    assert "narrator" in text
+    assert "<unattributed>" not in text

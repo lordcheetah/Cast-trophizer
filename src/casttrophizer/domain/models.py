@@ -36,6 +36,8 @@ __all__ = [
     "VoiceClip",
     "Book",
     "Project",
+    "find_narrator",
+    "resolve_segment_speaker_id",
 ]
 
 
@@ -64,7 +66,9 @@ class Segment:
 
     id: SegmentId
     text: str
-    speaker_id: SpeakerId | None  # resolves to Speaker.id; None == narrator
+    # resolves to Speaker.id; None resolves to the reserved narrator at render
+    # (see :func:`find_narrator`), so an unattributed quote is voiced by the narrator.
+    speaker_id: SpeakerId | None
     role: SpeakerRole
     confidence: float  # attribution confidence; low => flagged in review
     review_status: ReviewStatus
@@ -151,3 +155,37 @@ class Project:
     voice_clips: list[VoiceClip] = field(default_factory=list)
     stage_status: dict[str, ReviewStatus] = field(default_factory=dict)
     tts_params: dict[str, object] = field(default_factory=dict)
+
+
+def find_narrator(project: Project) -> Speaker | None:
+    """Return the project's reserved narrator (first ``NARRATOR``-role speaker), or None.
+
+    A pure, side-effect-free query — the shared lookup rule for "who is the narrator?".
+    Identity is by ``role == SpeakerRole.NARRATOR`` (not by name), matching what
+    :func:`casttrophizer.attribution.policy.ensure_narrator` creates and reuses; that
+    function delegates here so the rule cannot drift. Lives in the domain layer so both
+    ``audio/`` (voice resolution) and ``attribution/`` can call it without a cross-package
+    dependency. Returns ``None`` only when no narrator has been reserved yet (pre-attribution,
+    or a narrator-less project) — the synthesize layer treats that defensively.
+    """
+    for speaker in project.speakers:
+        if speaker.role == SpeakerRole.NARRATOR:
+            return speaker
+    return None
+
+
+def resolve_segment_speaker_id(segment: Segment, narrator: Speaker | None) -> SpeakerId | None:
+    """Resolve a segment's *effective* speaker id — the one rule voice resolution shares.
+
+    Returns ``segment.speaker_id`` when set; otherwise the reserved ``narrator``'s id (a
+    ``speaker_id=None`` segment is voiced by the narrator at render), or ``None`` when no
+    narrator exists (defensive can't-happen case). Every voice-resolution path — the
+    precheck (:func:`~casttrophizer.audio.synthesize.unresolved_voices`), the render loop
+    (:func:`~casttrophizer.audio.synthesize.synthesize_chapter`), and the cache key
+    (:meth:`~casttrophizer.workspace.audio_cache.AudioCache.key_for`) — goes through here so
+    the resolved voice cannot diverge between them. ``narrator`` is passed in (resolved once
+    by the caller via :func:`find_narrator`) to avoid re-scanning per segment.
+    """
+    if segment.speaker_id is not None:
+        return segment.speaker_id
+    return narrator.id if narrator is not None else None

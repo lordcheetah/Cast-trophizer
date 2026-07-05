@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from casttrophizer.domain.enums import ReviewStatus, SpeakerRole
 from casttrophizer.domain.ids import new_id
-from casttrophizer.domain.models import Project, Speaker
+from casttrophizer.domain.models import Project, Speaker, find_narrator
 
 __all__ = [
     "ATTRIBUTION_CONFIDENCE_THRESHOLD",
@@ -45,14 +45,15 @@ def review_status_for(
 def ensure_narrator(project: Project) -> Speaker:
     """Return the project's reserved narrator Speaker, creating one if absent.
 
-    Finds the first ``NARRATOR``-role speaker; if none exists, appends a fresh
-    ``Speaker(name="narrator", role=NARRATOR)`` to ``project.speakers``. Narrator
-    segments point at this speaker so the synthesize stage has a place to hang the
-    narrator voice clip.
+    Delegates the lookup to :func:`casttrophizer.domain.models.find_narrator` (the single
+    source of truth for the narrator predicate: first ``NARRATOR``-role speaker); if none
+    exists, appends a fresh ``Speaker(name="narrator", role=NARRATOR)`` to
+    ``project.speakers``. Narrator segments point at this speaker so the synthesize stage
+    has a place to hang the narrator voice clip.
     """
-    for speaker in project.speakers:
-        if speaker.role == SpeakerRole.NARRATOR:
-            return speaker
+    narrator = find_narrator(project)
+    if narrator is not None:
+        return narrator
     narrator = Speaker(id=new_id("spk"), name=_NARRATOR_NAME, role=SpeakerRole.NARRATOR)
     project.speakers.append(narrator)
     return narrator

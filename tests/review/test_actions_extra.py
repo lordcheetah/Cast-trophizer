@@ -2,8 +2,9 @@
 
 Complements ``test_actions.py`` with the cases the priority list calls out that the existing
 suite does not isolate: ``reassign_segment_to_new_speaker`` *reusing* an existing speaker
-(exactly one new CHARACTER ever created), ``set_segment_speaker(speaker_id=None)`` leaving the
-segment unresolved without raising, and reject_attribution leaving speaker/role intact.
+(exactly one new CHARACTER ever created), ``set_segment_speaker(speaker_id=None)`` storing None
+without raising (it renders as the narrator at synth), and reject_attribution leaving
+speaker/role intact.
 """
 
 from __future__ import annotations
@@ -47,12 +48,12 @@ def test_reassign_creates_exactly_one_speaker_then_reuses(review_ready_project: 
     assert other.speaker_id == first.id
 
 
-def test_set_segment_speaker_none_leaves_unresolved(review_ready_project: Project) -> None:
-    """``speaker_id=None`` is allowed (no raise) and leaves the segment unattributed."""
+def test_set_segment_speaker_none_stores_none(review_ready_project: Project) -> None:
+    """``speaker_id=None`` is allowed (no raise) and stores None (renders as narrator at synth)."""
     project = review_ready_project
     seg = _needs_review_segment(project)
     actions.set_segment_speaker(seg, project, speaker_id=None, role=SpeakerRole.NARRATOR)
-    assert seg.speaker_id is None
+    assert seg.speaker_id is None  # stored as None; resolves to the reserved narrator at render
     assert seg.review_status == ReviewStatus.APPROVED  # approve=True default still applies
 
 
