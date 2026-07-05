@@ -23,6 +23,10 @@ __all__ = [
     "DEFAULT_CLAUDE_MODEL",
     "DEFAULT_LMSTUDIO_MODEL",
     "DEFAULT_LMSTUDIO_BASE_URL",
+    "DEFAULT_LOUDNESS_ENABLED",
+    "DEFAULT_LOUDNESS_TARGET_LUFS",
+    "DEFAULT_LOUDNESS_PEAK_DBFS",
+    "DEFAULT_LOUDNESS_MAX_GAIN_DB",
     "AppConfig",
 ]
 
@@ -41,6 +45,14 @@ DEFAULT_LMSTUDIO_MODEL = "local-model"
 #: Default LM Studio OpenAI-compatible endpoint.
 DEFAULT_LMSTUDIO_BASE_URL = "http://localhost:1234/v1"
 
+#: Per-segment loudness-normalization defaults (see :mod:`casttrophizer.audio.loudness`).
+#: These are the canonical numeric defaults; ``LoudnessSettings`` reads them so ``config`` and
+#: the audio layer cannot drift. Kept here (not in ``audio``) so ``config`` stays audio-free.
+DEFAULT_LOUDNESS_ENABLED = True  # normalize per-segment loudness by default
+DEFAULT_LOUDNESS_TARGET_LUFS = -18.0  # integrated-loudness target (ITU-R BS.1770)
+DEFAULT_LOUDNESS_PEAK_DBFS = -1.0  # sample-peak ceiling
+DEFAULT_LOUDNESS_MAX_GAIN_DB = 30.0  # max amplification cap (guards short/quiet clips)
+
 
 @dataclass
 class AppConfig:
@@ -55,6 +67,10 @@ class AppConfig:
         lmstudio_model: Model name to request from LM Studio.
         lmstudio_base_url: LM Studio OpenAI-compatible base URL.
         workspaces_root: Default parent directory for new project workspaces.
+        loudness_enabled: Whether per-segment loudness normalization runs (on by default).
+        loudness_target_lufs: Integrated-loudness target for normalization (LUFS).
+        loudness_peak_dbfs: Sample-peak ceiling for normalization (dBFS).
+        loudness_max_gain_db: Max amplification cap for normalization (dB).
         tts_params: Global synthesis defaults merged into per-segment requests.
         voice_defaults: Reusable per-category default voice-clip paths for
             ``assign-voice --rest``. Keys are ``VoiceCategory`` values (``"man"`` / ``"woman"``
@@ -78,6 +94,11 @@ class AppConfig:
         default_factory=lambda: Path.home() / ".casttrophizer" / "workspaces"
     )
 
+    loudness_enabled: bool = DEFAULT_LOUDNESS_ENABLED
+    loudness_target_lufs: float = DEFAULT_LOUDNESS_TARGET_LUFS
+    loudness_peak_dbfs: float = DEFAULT_LOUDNESS_PEAK_DBFS
+    loudness_max_gain_db: float = DEFAULT_LOUDNESS_MAX_GAIN_DB
+
     tts_params: dict[str, object] = field(default_factory=dict)
 
     voice_defaults: dict[str, str] = field(default_factory=dict)
@@ -91,6 +112,8 @@ class AppConfig:
             ``CASTTROPHIZER_TTS_PROVIDER``, ``CASTTROPHIZER_CLAUDE_MODEL``,
             ``ANTHROPIC_API_KEY``, ``CASTTROPHIZER_LMSTUDIO_MODEL``,
             ``CASTTROPHIZER_LMSTUDIO_BASE_URL``, ``CASTTROPHIZER_WORKSPACES_ROOT``,
+            ``CASTTROPHIZER_LOUDNESS_ENABLED`` (``0``/``false``/``no`` -> off, else on),
+            ``CASTTROPHIZER_LOUDNESS_TARGET_LUFS`` / ``_PEAK_DBFS`` / ``_MAX_GAIN_DB`` (floats),
             ``CASTTROPHIZER_VOICE_MAN`` / ``_WOMAN`` / ``_BOY`` / ``_GIRL`` / ``_DEFAULT``
             (reusable ``assign-voice --rest`` default clips -> :attr:`voice_defaults`).
         """
@@ -105,6 +128,17 @@ class AppConfig:
         cfg.lmstudio_base_url = src.get("CASTTROPHIZER_LMSTUDIO_BASE_URL", cfg.lmstudio_base_url)
         if (root := src.get("CASTTROPHIZER_WORKSPACES_ROOT")) is not None:
             cfg.workspaces_root = Path(root)
+        if (enabled := src.get("CASTTROPHIZER_LOUDNESS_ENABLED")) is not None:
+            cfg.loudness_enabled = enabled.strip().lower() not in ("0", "false", "no", "off")
+        cfg.loudness_target_lufs = _float_env(
+            src, "CASTTROPHIZER_LOUDNESS_TARGET_LUFS", cfg.loudness_target_lufs
+        )
+        cfg.loudness_peak_dbfs = _float_env(
+            src, "CASTTROPHIZER_LOUDNESS_PEAK_DBFS", cfg.loudness_peak_dbfs
+        )
+        cfg.loudness_max_gain_db = _float_env(
+            src, "CASTTROPHIZER_LOUDNESS_MAX_GAIN_DB", cfg.loudness_max_gain_db
+        )
         cfg.voice_defaults = _voice_defaults_from_env(src)
         return cfg
 
@@ -126,3 +160,14 @@ def _voice_defaults_from_env(src: Mapping[str, str]) -> dict[str, str]:
     return {
         key: src[var] for key, var in _VOICE_DEFAULT_ENV.items() if src.get(var) not in (None, "")
     }
+
+
+def _float_env(src: Mapping[str, str], var: str, default: float) -> float:
+    """Parse ``src[var]`` as a float, falling back to ``default`` when unset or unparsable."""
+    raw = src.get(var)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default

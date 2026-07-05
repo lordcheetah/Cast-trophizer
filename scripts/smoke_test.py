@@ -39,6 +39,11 @@ import tempfile
 import time
 from pathlib import Path
 
+from casttrophizer.audio.loudness import (
+    DEFAULT_PEAK_CEILING_DBFS,
+    DEFAULT_TARGET_LUFS,
+    LoudnessSettings,
+)
 from casttrophizer.domain.enums import ReviewStatus, SpeakerRole
 from casttrophizer.domain.ids import new_id
 from casttrophizer.domain.models import (
@@ -190,6 +195,23 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--exaggeration", type=float, default=None)
     p.add_argument("--cfg-weight", type=float, default=None)
     p.add_argument("--seed", type=int, default=None)
+    p.add_argument(
+        "--target-lufs",
+        type=float,
+        default=None,
+        help="loudness-normalization target (default: config/-18.0 LUFS)",
+    )
+    p.add_argument(
+        "--peak-dbfs",
+        type=float,
+        default=None,
+        help="loudness-normalization sample-peak ceiling (default: config/-1.0 dBFS)",
+    )
+    p.add_argument(
+        "--no-loudness",
+        action="store_true",
+        help="disable per-segment loudness normalization for this smoke run",
+    )
     return p.parse_args(argv)
 
 
@@ -222,6 +244,17 @@ def main(argv: list[str]) -> int:
         tts_params["cfg_weight"] = args.cfg_weight
     if args.seed is not None:
         tts_params["seed"] = args.seed
+
+    # Fold a loudness block into tts_params so a real smoke render exercises normalization (and
+    # its cache-key interaction). Flags override the config/-defaults for the target and ceiling.
+    target_lufs = args.target_lufs if args.target_lufs is not None else DEFAULT_TARGET_LUFS
+    peak_dbfs = args.peak_dbfs if args.peak_dbfs is not None else DEFAULT_PEAK_CEILING_DBFS
+    loudness = LoudnessSettings(
+        enabled=not args.no_loudness,
+        target_lufs=target_lufs,
+        peak_ceiling_dbfs=peak_dbfs,
+    )
+    tts_params["loudness"] = loudness.to_params()
 
     workdir = args.workdir or Path(tempfile.mkdtemp(prefix="casttrophizer-smoke-"))
     workdir.mkdir(parents=True, exist_ok=True)

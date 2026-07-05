@@ -25,6 +25,9 @@ dependencies = [
 # Import path: `from chatterbox.tts import ChatterboxTTS` (dist: chatterbox-tts).
 tts = [
     "chatterbox-tts",
+    "pyloudnorm",              # ITU-R BS.1770 loudness for per-segment normalization
+    # (already a transitive dep of chatterbox-tts; listed explicitly to make it intentional).
+    # numpy arrives via torch. Both are lazy-imported inside audio/loudness.py.
 ]
 dev = [
     "pytest>=8",
@@ -62,6 +65,7 @@ files = ["src"]
 module = [
     "ebooklib", "ebooklib.*", "bs4", "bs4.*", "spellchecker", "spellchecker.*",
     "chatterbox", "chatterbox.*", "torch", "torch.*", "torchaudio", "torchaudio.*",
+    "pyloudnorm", "pyloudnorm.*",
 ]
 ignore_missing_imports = true
 

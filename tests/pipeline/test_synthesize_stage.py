@@ -14,6 +14,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
+from casttrophizer.audio.loudness import DEFAULT_PEAK_CEILING_DBFS, LoudnessSettings
+from casttrophizer.audio.wavfile import read_wav_mono_float
 from casttrophizer.domain.enums import ReviewStatus, SpeakerRole, StageName
 from casttrophizer.domain.models import Project, Segment, Speaker
 from casttrophizer.pipeline.runner import Pipeline
@@ -525,3 +529,182 @@ def test_pipeline_next_stage_after_synthesize(
     pipeline.run(_ctx(tmp_workspace, RecordingProgressReporter(), FakeTTSProvider()))
     reloaded = tmp_workspace.load()
     assert pipeline.next_stage(reloaded) is None  # the only stage is complete
+
+
+# --------------------------------------------------------------------------- #
+# loudness normalization (per-segment, run in the orchestration)
+# --------------------------------------------------------------------------- #
+def _enable_loudness(project: Project, **overrides: object) -> None:
+    """Seed a loudness block into the project's tts_params (as the CLI would at creation)."""
+    project.tts_params["loudness"] = LoudnessSettings(**overrides).to_params()  # type: ignore[arg-type]
+
+
+def test_loudness_enabled_run_completes_on_silence(
+    tmp_workspace: WorkspaceStore, synthesize_ready_project: Project
+) -> None:
+    """Loudness enabled: the silent FakeTTS clips normalize (short-circuit) without crashing."""
+    _enable_loudness(synthesize_ready_project)
+    tmp_workspace.save(synthesize_ready_project)
+
+    result = SynthesizeStage().run(
+        synthesize_ready_project,
+        _ctx(tmp_workspace, RecordingProgressReporter(), FakeTTSProvider()),
+    )
+    assert result.status == ReviewStatus.COMPLETED
+
+    reloaded = tmp_workspace.load()
+    cache = AudioCache(tmp_workspace.layout)
+    for seg in _renderable_segments(reloaded):
+        assert seg.audio_status == ReviewStatus.COMPLETED
+        assert seg.audio_cache_key is not None
+        assert cache.path_for_key(seg.audio_cache_key).is_file()  # silence untouched, still present
+
+
+def test_loudness_attenuates_loud_rendered_audio(
+    tmp_workspace: WorkspaceStore, synthesize_ready_project: Project
+) -> None:
+    """A LOUD fake render (constant 0.9) is attenuated toward target below the peak ceiling."""
+    _enable_loudness(synthesize_ready_project)
+    tmp_workspace.save(synthesize_ready_project)
+
+    SynthesizeStage().run(
+        synthesize_ready_project,
+        _ctx(tmp_workspace, RecordingProgressReporter(), FakeTTSProvider(loud=True)),
+    )
+
+    reloaded = tmp_workspace.load()
+    cache = AudioCache(tmp_workspace.layout)
+    ceiling = 10.0 ** (DEFAULT_PEAK_CEILING_DBFS / 20.0)
+    for seg in _renderable_segments(reloaded):
+        assert seg.audio_cache_key is not None
+        samples, _ = read_wav_mono_float(cache.path_for_key(seg.audio_cache_key))
+        peak = max(abs(s) for s in samples)
+        assert peak < 0.9  # attenuated from the 0.9 the loud fake wrote
+        assert peak <= ceiling + 1e-3  # under the -1 dBFS ceiling (within a 16-bit quantum)
+
+
+def test_loudness_setting_changes_cache_key(
+    tmp_workspace: WorkspaceStore, synthesize_ready_project: Project
+) -> None:
+    """Adding/changing/toggling the loudness block changes AudioCache.key_for for a segment."""
+    project = synthesize_ready_project
+    seg = _renderable_segments(project)[0]
+    key_no_block = AudioCache.key_for(seg, project)
+
+    _enable_loudness(project)  # enabled, -18 LUFS
+    key_enabled = AudioCache.key_for(seg, project)
+    assert key_enabled != key_no_block  # turning normalization on re-keys the segment
+
+    _enable_loudness(project, target_lufs=-14.0)  # change the target
+    key_new_target = AudioCache.key_for(seg, project)
+    assert key_new_target != key_enabled
+
+    _enable_loudness(project, enabled=False)  # toggle off
+    key_disabled = AudioCache.key_for(seg, project)
+    assert key_disabled != key_enabled
+    assert key_disabled != key_new_target
+
+
+def test_loudness_target_change_regenerates_everything(
+    tmp_workspace: WorkspaceStore, synthesize_ready_project: Project
+) -> None:
+    """Changing tts_params['loudness']['target_lufs'] re-renders every renderable segment."""
+    _enable_loudness(synthesize_ready_project)
+    SynthesizeStage().run(
+        synthesize_ready_project,
+        _ctx(tmp_workspace, RecordingProgressReporter(), FakeTTSProvider()),
+    )
+    persisted = tmp_workspace.load()
+    _enable_loudness(persisted, target_lufs=-12.0)  # change the loudness target
+    tmp_workspace.save(persisted)
+
+    fresh = FakeTTSProvider()
+    SynthesizeStage().run(persisted, _ctx(tmp_workspace, RecordingProgressReporter(), fresh))
+    assert len(fresh.synthesize_calls) == len(_renderable_segments(persisted))
+
+
+def test_cached_segment_is_not_re_normalized(
+    tmp_workspace: WorkspaceStore,
+    synthesize_ready_project: Project,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A SKIPPED (cache-hit) segment is not re-normalized: normalize runs once per render only."""
+    _enable_loudness(synthesize_ready_project)
+    tmp_workspace.save(synthesize_ready_project)
+
+    calls: list[Path] = []
+    import casttrophizer.audio.synthesize as synth_mod
+
+    def _counting_normalize(path: Path, settings: LoudnessSettings) -> None:
+        calls.append(path)
+
+    monkeypatch.setattr(synth_mod, "normalize_wav_file", _counting_normalize)
+
+    # First run: every renderable segment renders -> one normalize call each.
+    SynthesizeStage().run(
+        synthesize_ready_project,
+        _ctx(tmp_workspace, RecordingProgressReporter(), FakeTTSProvider()),
+    )
+    after_first = len(calls)
+    assert after_first == len(_renderable_segments(synthesize_ready_project))
+
+    # Second run: all cache hits -> zero further normalize calls (cached audio is not touched).
+    persisted = tmp_workspace.load()
+    SynthesizeStage().run(
+        persisted, _ctx(tmp_workspace, RecordingProgressReporter(), FakeTTSProvider())
+    )
+    assert len(calls) == after_first  # no re-normalization of already-rendered segments
+
+
+def test_no_loudness_block_skips_normalization(
+    tmp_workspace: WorkspaceStore,
+    synthesize_ready_project: Project,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A project without a loudness block (older project) never calls normalize_wav_file."""
+    assert "loudness" not in synthesize_ready_project.tts_params  # fixture has no block
+
+    calls: list[Path] = []
+    import casttrophizer.audio.synthesize as synth_mod
+
+    monkeypatch.setattr(synth_mod, "normalize_wav_file", lambda path, settings: calls.append(path))
+    SynthesizeStage().run(
+        synthesize_ready_project,
+        _ctx(tmp_workspace, RecordingProgressReporter(), FakeTTSProvider()),
+    )
+    assert calls == []  # from_params returned None -> normalization skipped entirely
+
+
+def test_normalize_failure_does_not_fail_the_render(
+    tmp_workspace: WorkspaceStore,
+    synthesize_ready_project: Project,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A raising ``normalize_wav_file`` is logged-and-swallowed: the render still completes.
+
+    Normalization is post-processing on an already-rendered WAV; a failure there must never
+    fail an otherwise-good render. Every segment ends COMPLETED with its (un-normalized) WAV
+    still present on disk.
+    """
+    _enable_loudness(synthesize_ready_project)
+    tmp_workspace.save(synthesize_ready_project)
+
+    import casttrophizer.audio.synthesize as synth_mod
+
+    def _boom(path: Path, settings: LoudnessSettings) -> None:
+        raise RuntimeError("normalization exploded")
+
+    monkeypatch.setattr(synth_mod, "normalize_wav_file", _boom)
+
+    result = SynthesizeStage().run(
+        synthesize_ready_project,
+        _ctx(tmp_workspace, RecordingProgressReporter(), FakeTTSProvider()),
+    )
+    assert result.status == ReviewStatus.COMPLETED  # normalize failure did not fail the render
+
+    reloaded = tmp_workspace.load()
+    cache = AudioCache(tmp_workspace.layout)
+    for seg in _renderable_segments(reloaded):
+        assert seg.audio_status == ReviewStatus.COMPLETED
+        assert seg.audio_cache_key is not None
+        assert cache.path_for_key(seg.audio_cache_key).is_file()  # raw WAV kept

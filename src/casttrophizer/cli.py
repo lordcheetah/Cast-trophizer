@@ -38,6 +38,7 @@ from pathlib import Path
 from types import FrameType
 from typing import TYPE_CHECKING
 
+from casttrophizer.audio.loudness import LoudnessSettings
 from casttrophizer.audio.synthesize import unresolved_speakers
 from casttrophizer.config import AppConfig
 from casttrophizer.domain.enums import ReviewStatus, StageName
@@ -183,12 +184,16 @@ class CliDeps:
 # --------------------------------------------------------------------------- #
 # project factory + pipeline construction
 # --------------------------------------------------------------------------- #
-def _new_project(epub: Path, name: str, workspace_dir: Path) -> Project:
+def _new_project(
+    epub: Path, name: str, workspace_dir: Path, tts_params: dict[str, object]
+) -> Project:
     """Build the initial project: a book pointing at the (absolute) EPUB, no chapters yet.
 
     ParseStage fills ``book.chapters`` and overwrites the placeholder title/author from the
     parsed metadata on its first ``run``. Everything else (speakers, voice clips, stage
-    status) starts empty.
+    status) starts empty. ``tts_params`` (seeded from :class:`AppConfig`, including the
+    ``"loudness"`` block) rides into the project so it feeds the per-segment cache key and the
+    synthesis requests from the very first render.
     """
     book = Book(
         title=name,
@@ -203,7 +208,21 @@ def _new_project(epub: Path, name: str, workspace_dir: Path) -> Project:
         name=name,
         workspace_dir=str(workspace_dir),
         book=book,
+        tts_params=tts_params,
     )
+
+
+def _seed_tts_params(config: AppConfig) -> dict[str, object]:
+    """Build a new project's ``tts_params`` from config: global params + the loudness block.
+
+    Folds ``config.tts_params`` (global synthesis defaults) together with the resolved loudness
+    settings under ``"loudness"`` so both feed the cache key and per-segment requests. Fixes the
+    prior gap where ``_new_project`` ignored ``config.tts_params`` entirely.
+    """
+    return {
+        **config.tts_params,
+        "loudness": LoudnessSettings.from_config(config).to_params(),
+    }
 
 
 def _build_pipeline(deps: CliDeps) -> Pipeline:
@@ -364,8 +383,9 @@ def cmd_new(args: argparse.Namespace, deps: CliDeps) -> int:
             code=_EXIT_ERROR,
         )
 
+    config = deps.config or AppConfig.from_env()
     name = args.name or epub.stem
-    project = _new_project(epub, name, workdir)
+    project = _new_project(epub, name, workdir, _seed_tts_params(config))
     store.save(project)
     print(f"created project {name!r} at {workdir}")
     print("next: castrun run   (parses, corrects, attributes, then halts for review)")

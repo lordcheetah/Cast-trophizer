@@ -27,14 +27,18 @@ Two seams the stage drives:
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable
 from pathlib import Path
 
+from casttrophizer.audio.loudness import LoudnessSettings, normalize_wav_file
 from casttrophizer.domain.enums import ReviewStatus
 from casttrophizer.domain.models import Chapter, Project, Speaker, VoiceClip
 from casttrophizer.errors import TTSProviderError
 from casttrophizer.providers.base import SynthesisRequest, TTSProvider
 from casttrophizer.workspace.audio_cache import AudioCache
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "STOP_POLL_INTERVAL",
@@ -197,6 +201,10 @@ def synthesize_chapter(
     failed_any = False
     processed = 0
 
+    # Per-segment loudness normalization (confirmed decision): applied to each just-rendered
+    # WAV. ``None`` => the project has no loudness block (older project) -> skip entirely.
+    loudness = LoudnessSettings.from_params(project.tts_params)
+
     for line in chapter.lines:
         for segment in line.segments:
             if processed and processed % STOP_POLL_INTERVAL == 0 and should_stop():
@@ -241,6 +249,20 @@ def synthesize_chapter(
                 segment.audio_status = ReviewStatus.FAILED
                 failed_any = True
             else:
+                # Normalize the just-rendered WAV to a consistent loudness before stamping the
+                # segment COMPLETED. A SKIPPED (cache-hit) segment is never re-normalized — its
+                # settings are in the cache key, so a settings change already forces a re-render.
+                # Normalization must never fail an otherwise-good render (log-and-continue: the
+                # segment stays COMPLETED with un-normalized audio).
+                if loudness is not None and loudness.enabled:
+                    try:
+                        normalize_wav_file(cache.path_for_key(key), loudness)
+                    except Exception:  # noqa: BLE001 - defensive; a normalize failure is non-fatal
+                        logger.warning(
+                            "loudness normalization failed for segment %s; keeping raw audio",
+                            segment.id,
+                            exc_info=True,
+                        )
                 segment.audio_cache_key = key
                 segment.audio_status = ReviewStatus.COMPLETED
                 rendered_any = True

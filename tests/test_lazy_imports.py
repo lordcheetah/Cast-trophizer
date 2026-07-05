@@ -46,6 +46,21 @@ _LAZY_IMPORT_CASES: list[tuple[str, str]] = [
     ("casttrophizer.audio.synthesize", "chatterbox"),
     ("casttrophizer.pipeline.stages.synthesize", "torch"),
     ("casttrophizer.pipeline.stages.synthesize", "chatterbox"),
+    # Loudness normalization keeps numpy/pyloudnorm lazy (imported only inside the measurement
+    # function), so importing the module — or the synthesize orchestration that uses it — must
+    # not load them. This is the guarantee that CI without the ``tts`` extra never needs them.
+    ("casttrophizer.audio.loudness", "numpy"),
+    ("casttrophizer.audio.loudness", "pyloudnorm"),
+    ("casttrophizer.audio.synthesize", "numpy"),
+    ("casttrophizer.audio.synthesize", "pyloudnorm"),
+    ("casttrophizer.audio.wavfile", "numpy"),
+    # config carries the loudness numeric defaults but must stay audio/numpy-free; the CLI
+    # seeds a project's loudness block from config yet must not drag in numpy/pyloudnorm/torch.
+    ("casttrophizer.config", "numpy"),
+    ("casttrophizer.config", "pyloudnorm"),
+    ("casttrophizer.cli", "numpy"),
+    ("casttrophizer.cli", "pyloudnorm"),
+    ("casttrophizer.cli", "torch"),
     # The factory package re-exports ABCs only — no concrete SDK should appear.
     ("casttrophizer.providers", "anthropic"),
     ("casttrophizer.providers", "openai"),

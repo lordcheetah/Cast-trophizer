@@ -21,46 +21,14 @@ real render.
 
 from __future__ import annotations
 
-import sys
-import wave
-from array import array
 from pathlib import Path
 from typing import Any
 
+from casttrophizer.audio.wavfile import write_wav_mono16
 from casttrophizer.errors import TTSProviderError
 from casttrophizer.providers.base import SynthesisRequest, SynthesisResult, TTSProvider
 
 __all__ = ["ChatterboxProvider"]
-
-
-def _to_pcm16(sample: float) -> int:
-    """Clamp a float sample in [-1, 1] and scale to a signed 16-bit PCM integer."""
-    value = int(sample * 32767.0)
-    if value < -32768:
-        return -32768
-    if value > 32767:
-        return 32767
-    return value
-
-
-def _write_wav_mono16(out_path: Path, samples: list[float], sample_rate: int) -> None:
-    """Write ``samples`` (float, mono) as a 16-bit PCM WAV via the stdlib ``wave`` module.
-
-    We deliberately do NOT use ``torchaudio.save``: torchaudio >= ~2.9 dispatches ``save`` to
-    TorchCodec, a separate native dependency that is not part of the ``tts`` extra (it raises
-    ``ImportError: TorchCodec is required``). Chatterbox output is a plain float waveform, so a
-    stdlib WAV write is both dependency-light and produces the standard 16-bit PCM the assemble
-    stage already reads for chapter timing.
-    """
-    pcm = array("h", (_to_pcm16(s) for s in samples))
-    if sys.byteorder == "big":  # WAV is little-endian; array is native-endian
-        pcm.byteswap()
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    with wave.open(str(out_path), "wb") as wav_file:
-        wav_file.setnchannels(1)
-        wav_file.setsampwidth(2)
-        wav_file.setframerate(sample_rate)
-        wav_file.writeframes(pcm.tobytes())
 
 
 class ChatterboxProvider(TTSProvider):
@@ -147,10 +115,10 @@ class ChatterboxProvider(TTSProvider):
             sample_rate = int(model.sr)
 
             # Flatten to a mono float list and write a 16-bit PCM WAV with the stdlib (see
-            # _write_wav_mono16 for why torchaudio.save is avoided).
+            # audio.wavfile.write_wav_mono16 for why torchaudio.save is avoided).
             tensor = wav if hasattr(wav, "detach") else torch.as_tensor(wav)
             samples: list[float] = tensor.detach().cpu().reshape(-1).tolist()
-            _write_wav_mono16(out_path, samples, sample_rate)
+            write_wav_mono16(out_path, samples, sample_rate)
 
             num_samples = len(samples)
         except TTSProviderError:
