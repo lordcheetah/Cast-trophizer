@@ -10,6 +10,7 @@ from __future__ import annotations
 __all__ = [
     "CasttrophizerError",
     "ConfigError",
+    "PreconditionError",
     "WorkspaceError",
     "SerializationError",
     "MigrationError",
@@ -30,6 +31,17 @@ class CasttrophizerError(Exception):
 
 class ConfigError(CasttrophizerError):
     """Invalid or missing configuration (bad provider selection, missing paths, etc.)."""
+
+
+class PreconditionError(CasttrophizerError):
+    """A required precondition for a run is not met (e.g. an unavailable LLM at preflight).
+
+    Raised by the application-service preflight *before* the pipeline starts — an LLM key is
+    missing while attribution still has to run. Distinct from :class:`ConfigError` (an
+    unknown/misconfigured provider name): the provider was built fine, it just is not usable
+    right now. Front-ends map it to a friendly "set your key" message (CLI: exit 2; UI: a
+    dialog that does not start the worker) rather than a mid-stage FAILED.
+    """
 
 
 class WorkspaceError(CasttrophizerError):

@@ -4,8 +4,10 @@ This is an **orchestrator only**: it constructs the existing
 :class:`~casttrophizer.pipeline.runner.Pipeline`, builds a
 :class:`~casttrophizer.pipeline.stage.StageContext`, injects providers, and calls
 ``Pipeline.run(ctx)``. All stage logic, resumability, and the review gate already exist and
-are unchanged. The one net-new non-orchestration piece is :func:`_new_project` (build an
-initial :class:`~casttrophizer.domain.models.Project` from an EPUB path).
+are unchanged. The shared orchestration (project creation, provider construction, the run
+pass, outcome/status classification) lives in :mod:`casttrophizer.app_service`; this module
+is a thin presentation wrapper over it (argparse, printing, exit-code mapping, SIGINT, and
+the ``--auto-accept`` re-run).
 
 Command surface::
 
@@ -33,37 +35,28 @@ import argparse
 import signal
 import sys
 from collections.abc import Callable
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from pathlib import Path
 from types import FrameType
 from typing import TYPE_CHECKING
 
-from casttrophizer.audio.loudness import LoudnessSettings
+from casttrophizer.app_service.deps import (
+    AppServiceDeps,
+    default_llm_factory,
+    default_tts_factory,
+)
+from casttrophizer.app_service.outcome import RunOutcomeKind, interpret_result
+from casttrophizer.app_service.pipeline_service import build_pipeline, run_pipeline
+from casttrophizer.app_service.projects import ProjectExistsError, create_project
+from casttrophizer.app_service.status import next_stage_name, stage_status_rows
 from casttrophizer.audio.synthesize import unresolved_speakers
 from casttrophizer.config import AppConfig
 from casttrophizer.domain.enums import ReviewStatus, StageName
-from casttrophizer.domain.ids import new_id
-from casttrophizer.domain.models import Book, Project, Speaker, VoiceClip
-from casttrophizer.domain.serialization import CURRENT_SCHEMA_VERSION
-from casttrophizer.ebook import parser_for
-from casttrophizer.errors import CasttrophizerError, ConfigError
+from casttrophizer.domain.models import Project, Speaker, VoiceClip
+from casttrophizer.errors import CasttrophizerError, ConfigError, PreconditionError
 from casttrophizer.pipeline.progress import ProgressReporter
-from casttrophizer.pipeline.runner import Pipeline
-from casttrophizer.pipeline.stage import StageContext, StageResult
-from casttrophizer.pipeline.stages import (
-    AssembleStage,
-    CorrectTextStage,
-    ParseStage,
-    ReviewStage,
-    SegmentAttributeStage,
-    SynthesizeStage,
-)
-from casttrophizer.providers import (
-    LLMProvider,
-    TTSProvider,
-    build_llm_provider,
-    build_tts_provider,
-)
+from casttrophizer.pipeline.stage import StageResult
+from casttrophizer.providers import LLMProvider, TTSProvider
 from casttrophizer.review import actions
 from casttrophizer.review.gate import describe_blockers, review_blockers
 from casttrophizer.review.service import ReviewService
@@ -158,85 +151,31 @@ def _install_sigint(progress: ProgressReporter) -> Callable[[], None]:
 
 
 # --------------------------------------------------------------------------- #
-# injection seam + default lazy factories
+# injection seam (delegates the shared fields to app_service.AppServiceDeps)
 # --------------------------------------------------------------------------- #
-def _default_llm_factory(config: AppConfig) -> LLMProvider:
-    """Build the configured LLM provider (SDK imported lazily inside the factory)."""
-    return build_llm_provider(config)
-
-
-def _default_tts_factory(config: AppConfig) -> TTSProvider:
-    """Build the configured TTS provider (chatterbox imported lazily inside the factory)."""
-    return build_tts_provider(config)
-
-
 @dataclass
 class CliDeps:
-    """Injection seam so tests drive the CLI with offline fakes (no real API/model/ffmpeg)."""
+    """Injection seam so tests drive the CLI with offline fakes (no real API/model/ffmpeg).
 
-    llm_factory: Callable[[AppConfig], LLMProvider] = _default_llm_factory
-    tts_factory: Callable[[AppConfig], TTSProvider] = _default_tts_factory
+    The provider/assembler/config fields mirror
+    :class:`~casttrophizer.app_service.deps.AppServiceDeps` (see :meth:`to_app_service_deps`);
+    ``progress_factory`` is CLI-only (the UI supplies its own Qt reporter).
+    """
+
+    llm_factory: Callable[[AppConfig], LLMProvider] = default_llm_factory
+    tts_factory: Callable[[AppConfig], TTSProvider] = default_tts_factory
     assembler: M4BAssembler | None = None  # -> AssembleStage(assembler=...); None = real one
     progress_factory: Callable[[], ProgressReporter] = PrintReporter
     config: AppConfig | None = None  # None -> AppConfig.from_env()
 
-
-# --------------------------------------------------------------------------- #
-# project factory + pipeline construction
-# --------------------------------------------------------------------------- #
-def _new_project(
-    epub: Path, name: str, workspace_dir: Path, tts_params: dict[str, object]
-) -> Project:
-    """Build the initial project: a book pointing at the (absolute) EPUB, no chapters yet.
-
-    ParseStage fills ``book.chapters`` and overwrites the placeholder title/author from the
-    parsed metadata on its first ``run``. Everything else (speakers, voice clips, stage
-    status) starts empty. ``tts_params`` (seeded from :class:`AppConfig`, including the
-    ``"loudness"`` block) rides into the project so it feeds the per-segment cache key and the
-    synthesis requests from the very first render.
-    """
-    book = Book(
-        title=name,
-        author="",
-        source_ebook_path=str(epub.resolve()),
-        cover_image_path=None,
-        chapters=[],
-    )
-    return Project(
-        schema_version=CURRENT_SCHEMA_VERSION,
-        id=new_id("proj"),
-        name=name,
-        workspace_dir=str(workspace_dir),
-        book=book,
-        tts_params=tts_params,
-    )
-
-
-def _seed_tts_params(config: AppConfig) -> dict[str, object]:
-    """Build a new project's ``tts_params`` from config: global params + the loudness block.
-
-    Folds ``config.tts_params`` (global synthesis defaults) together with the resolved loudness
-    settings under ``"loudness"`` so both feed the cache key and per-segment requests. Fixes the
-    prior gap where ``_new_project`` ignored ``config.tts_params`` entirely.
-    """
-    return {
-        **config.tts_params,
-        "loudness": LoudnessSettings.from_config(config).to_params(),
-    }
-
-
-def _build_pipeline(deps: CliDeps) -> Pipeline:
-    """Instantiate the six stages in order; AssembleStage gets its assembler via ``__init__``."""
-    return Pipeline(
-        [
-            ParseStage(),
-            CorrectTextStage(),
-            SegmentAttributeStage(),
-            ReviewStage(),
-            SynthesizeStage(),
-            AssembleStage(assembler=deps.assembler),
-        ]
-    )
+    def to_app_service_deps(self) -> AppServiceDeps:
+        """Adapt to the shared :class:`AppServiceDeps` (drops the CLI-only progress factory)."""
+        return AppServiceDeps(
+            llm_factory=self.llm_factory,
+            tts_factory=self.tts_factory,
+            assembler=self.assembler,
+            config=self.config,
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -287,50 +226,6 @@ def _resolve_speaker(project: Project, token: str) -> Speaker:
 
 
 # --------------------------------------------------------------------------- #
-# provider construction (always built + injected; only the LLM key is preflighted)
-# --------------------------------------------------------------------------- #
-def _build_llm(
-    deps: CliDeps, config: AppConfig, provider: str | None, *, preflight: bool
-) -> LLMProvider:
-    """Build the LLM provider, optionally front-running the attribute stage's own guard.
-
-    Construction is cheap (no ``anthropic`` import — that stays lazy inside the provider's
-    methods), so the provider is always built and injected. When ``preflight`` is set (i.e.
-    attribution is still pending, so the attribute stage *will* run this pass), an
-    unavailable provider fails fast with a clear "set your key" message before any stage
-    runs, instead of a mid-stage FAILED. A completed attribution skips the preflight — a
-    finished project needs no LLM key.
-    """
-    cfg = replace(config, llm_provider=provider) if provider else config
-    try:
-        llm = deps.llm_factory(cfg)
-    except ConfigError as exc:
-        raise CliError(str(exc), code=_EXIT_PRECONDITION) from exc
-    if preflight and not llm.is_available():
-        raise CliError(
-            "attribution needs an LLM: set ANTHROPIC_API_KEY "
-            "(or use `--provider lmstudio` with LM Studio running)",
-            code=_EXIT_PRECONDITION,
-        )
-    return llm
-
-
-def _build_tts(deps: CliDeps, config: AppConfig) -> TTSProvider:
-    """Build the TTS provider so synthesize always has one when reached.
-
-    Construction is cheap (no ``torch``/``chatterbox`` import — those stay lazy inside the
-    provider's methods), so it is always built and injected. There is **no** pre-emptive
-    availability preflight: the SynthesizeStage guard returns FAILED ("TTS provider ...
-    unavailable") if the ``tts`` extra is missing, which the CLI reports. A ``ConfigError``
-    for a misconfigured provider name is still surfaced as a precondition failure.
-    """
-    try:
-        return deps.tts_factory(config)
-    except ConfigError as exc:
-        raise CliError(str(exc), code=_EXIT_PRECONDITION) from exc
-
-
-# --------------------------------------------------------------------------- #
 # --auto-accept: resolve gate criteria 1 & 2 non-interactively
 # --------------------------------------------------------------------------- #
 def _auto_accept(store: WorkspaceStore, project: Project) -> bool:
@@ -367,95 +262,47 @@ def _auto_accept(store: WorkspaceStore, project: Project) -> bool:
 # --------------------------------------------------------------------------- #
 def cmd_new(args: argparse.Namespace, deps: CliDeps) -> int:
     """Create a project from an EPUB and persist it into the workspace."""
-    epub = Path(args.epub)
-    if not epub.is_file():
-        raise CliError(f"epub not found: {epub}", code=_EXIT_ERROR)
+    workdir = _workdir(args)
+    config = deps.config or AppConfig.from_env()
     try:
-        parser_for(epub)  # validate the format is supported before writing anything
+        _, project = create_project(
+            Path(args.epub), args.name, workdir, config, overwrite=args.force
+        )
+    except ProjectExistsError as exc:
+        raise CliError(f"{exc}; pass --force to overwrite", code=_EXIT_ERROR) from exc
     except CasttrophizerError as exc:
         raise CliError(str(exc), code=_EXIT_ERROR) from exc
 
-    workdir = _workdir(args)
-    store = WorkspaceStore.for_dir(workdir)
-    if store.exists() and not args.force:
-        raise CliError(
-            f"a project already exists at {workdir}; pass --force to overwrite",
-            code=_EXIT_ERROR,
-        )
-
-    config = deps.config or AppConfig.from_env()
-    name = args.name or epub.stem
-    project = _new_project(epub, name, workdir, _seed_tts_params(config))
-    store.save(project)
-    print(f"created project {name!r} at {workdir}")
+    print(f"created project {project.name!r} at {workdir}")
     print("next: castrun run   (parses, corrects, attributes, then halts for review)")
     return _EXIT_OK
-
-
-def _run_once(
-    store: WorkspaceStore,
-    pipeline: Pipeline,
-    progress: ProgressReporter,
-    config: AppConfig,
-    deps: CliDeps,
-    *,
-    provider: str | None,
-    until: StageName | None,
-) -> StageResult:
-    """Build both providers, inject them, and run the pipeline.
-
-    ``Pipeline.run`` advances through several stages in one call, so it can carry a
-    vacuously-satisfied review straight into synthesize. Deciding *statically* (before the
-    run) whether to build a provider therefore risks reaching a stage whose provider was
-    never built. Instead both providers are **always** built and injected — construction is
-    cheap (it imports no heavy SDK; ``torch``/``anthropic`` load lazily inside the provider
-    methods, only when synthesize/attribute actually run). The stages' own guards handle an
-    unavailable provider (SynthesizeStage -> FAILED "unavailable"; AssembleStage -> FAILED
-    "ffmpeg not found"), which the CLI reports.
-
-    The one fail-fast kept here is the **LLM key preflight**, and only while the attribute
-    stage will actually run this pass — i.e. attribution is still pending AND ``--until`` does
-    not stop before it. An unconfigured LLM fails early with a clear "set your key" message
-    instead of a mid-stage FAILED; a completed attribution (or a ``--until parse``/``correct``
-    run that never reaches attribute) needs no key, so the preflight is skipped.
-    """
-    project = store.load()
-    by_name = {stage.name: stage for stage in pipeline.stages}
-    attribute_done = by_name[StageName.ATTRIBUTE].is_complete(project)
-
-    # The attribute stage only runs this pass if it isn't already done AND --until doesn't
-    # stop before it — so a `run --until parse` needs no LLM key.
-    order = [stage.name for stage in pipeline.stages]
-    attribute_reachable = until is None or order.index(until) >= order.index(StageName.ATTRIBUTE)
-
-    llm = _build_llm(deps, config, provider, preflight=not attribute_done and attribute_reachable)
-    tts = _build_tts(deps, config)
-
-    ctx = StageContext(store=store, progress=progress, llm=llm, tts=tts, config=config)
-    return pipeline.run(ctx, until=until)
 
 
 def cmd_run(args: argparse.Namespace, deps: CliDeps) -> int:
     """Advance the pipeline from wherever it is; ``--auto-accept`` clears criteria 1 & 2."""
     store = _require_store(args)
+    app_deps = deps.to_app_service_deps()
     config = deps.config or AppConfig.from_env()
-    pipeline = _build_pipeline(deps)
+    pipeline = build_pipeline(app_deps)
     progress = deps.progress_factory()
     restore_sigint = _install_sigint(progress)
     until = StageName(args.until) if args.until else None
     final = pipeline.stages[-1].name
 
     try:
-        result = _run_once(
-            store, pipeline, progress, config, deps, provider=args.provider, until=until
+        result = run_pipeline(
+            store, pipeline, app_deps, config, progress, provider=args.provider, until=until
         )
 
         if result.status == ReviewStatus.NEEDS_REVIEW and args.auto_accept:
             project = store.load()
             if _auto_accept(store, project):
-                result = _run_once(
-                    store, pipeline, progress, config, deps, provider=args.provider, until=until
+                result = run_pipeline(
+                    store, pipeline, app_deps, config, progress, provider=args.provider, until=until
                 )
+    except (PreconditionError, ConfigError) as exc:
+        # The shared layer raises these Qt/CLI-free; map them to the exit-2 precondition UX.
+        raise CliError(str(exc), code=_EXIT_PRECONDITION) from exc
     finally:
         restore_sigint()
 
@@ -469,29 +316,27 @@ def _report_run(
     until: StageName | None = None,
     final: StageName = StageName.ASSEMBLE,
 ) -> int:
-    """Print the run outcome + next-step hints and map it to a process exit code.
+    """Print the classified run outcome + next-step hints and map it to a process exit code.
 
-    A COMPLETED status is only a *full-pipeline* completion when the stage that finished is
-    the final stage (assemble). With ``--until`` set to a pre-synthesize stage, the runner
-    returns a COMPLETED result for the stage it stopped at — that is NOT "the audiobook is
-    done", so it reports "stopped after <stage>" with the cooperative-stop exit code instead
-    of the misleading "complete"/exit 0.
+    Classification (COMPLETED vs. a ``--until`` early stop, NEEDS_REVIEW, STOPPED, FAILED)
+    comes from :func:`~casttrophizer.app_service.interpret_result`; this function only prints
+    and maps to a process exit code. An early ``--until`` stop classifies as STOPPED (the
+    audiobook is NOT done), reported with the cooperative-stop exit code, never "complete".
     """
-    if result.status == ReviewStatus.COMPLETED:
-        if until is not None and result.stage != final:
-            print(f"stopped after {result.stage.value}; re-run `castrun run` to continue")
-            return _EXIT_STOPPED
-        m4bs = sorted(store.layout.output_dir.glob("*.m4b"))
-        if m4bs:
-            print(f"complete; output: {m4bs[0]}")
+    outcome = interpret_result(result, store, until=until, final=final)
+
+    if outcome.kind == RunOutcomeKind.COMPLETED:
+        if outcome.output_path is not None:
+            print(f"complete; output: {outcome.output_path}")
         else:
             print("complete")
         return _EXIT_OK
 
-    if result.status == ReviewStatus.NEEDS_REVIEW:
+    if outcome.kind == RunOutcomeKind.NEEDS_REVIEW:
+        assert outcome.blockers is not None  # populated for NEEDS_REVIEW
+        blockers = outcome.blockers
         project = store.load()
-        blockers = review_blockers(project)
-        print(f"halted for review: {describe_blockers(blockers)}")
+        print(f"halted for review: {outcome.summary}")
         if blockers.needs_attribution or blockers.pending_suggestions:
             print("  approve attributions / resolve text edits: re-run with `--auto-accept`")
         for index, speaker in enumerate(project.speakers):
@@ -507,8 +352,11 @@ def _report_run(
             )
         return _EXIT_NEEDS_REVIEW
 
-    if result.status == ReviewStatus.STOPPED:
-        print("stopped; re-run `castrun run` to resume")
+    if outcome.kind == RunOutcomeKind.STOPPED:
+        if result.status == ReviewStatus.COMPLETED:  # early --until stop
+            print(f"stopped after {result.stage.value}; re-run `castrun run` to continue")
+        else:
+            print("stopped; re-run `castrun run` to resume")
         return _EXIT_STOPPED
 
     print(f"failed: {result.message}")
@@ -519,15 +367,14 @@ def cmd_status(args: argparse.Namespace, deps: CliDeps) -> int:
     """Print per-stage status, the next stage, and (past attribute) the review blockers."""
     store = _require_store(args)
     project = store.load()
-    pipeline = _build_pipeline(deps)
+    pipeline = build_pipeline(deps.to_app_service_deps())
 
     print(f"project: {project.name}")
-    for stage in StageName:
-        status = project.stage_status.get(str(stage))
-        print(f"  {stage.value:11} {status.value if status else '-'}")
+    for row in stage_status_rows(project, pipeline):
+        print(f"  {row.name.value:11} {row.status.value if row.status else '-'}")
 
-    nxt = pipeline.next_stage(project)
-    print(f"next: {nxt.name.value if nxt else 'complete'}")
+    nxt = next_stage_name(project, pipeline)
+    print(f"next: {nxt.value if nxt else 'complete'}")
 
     by_name = {stage.name: stage for stage in pipeline.stages}
     if by_name[StageName.ATTRIBUTE].is_complete(project):
