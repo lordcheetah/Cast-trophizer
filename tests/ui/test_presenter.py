@@ -15,10 +15,11 @@ from casttrophizer.app_service import AppServiceDeps, RunOutcomeKind
 from casttrophizer.app_service.status import StageRow
 from casttrophizer.config import AppConfig
 from casttrophizer.domain.enums import ReviewStatus, StageName
-from casttrophizer.domain.models import Project
+from casttrophizer.domain.models import Project, Segment
 from casttrophizer.pipeline.runner import Pipeline
 from casttrophizer.pipeline.stage import StageResult
 from casttrophizer.providers import LLMProvider, TTSProvider
+from casttrophizer.review.service import ReviewService
 from casttrophizer.ui.presenter import ProjectPresenter, ProjectView, RunExecutor
 from casttrophizer.workspace.store import WorkspaceStore
 from tests.fakes import FakeLLMProvider, FakeM4BAssembler, FakeTTSProvider
@@ -36,6 +37,7 @@ class FakeProjectView:
         self.project_loaded: tuple[str, str] | None = None
         self.stage_rows: list[StageRow] | None = None
         self.next_stage: object = "UNSET"
+        self.review_available: list[bool] = []
         self.running: list[bool] = []
         self.progress: list[tuple[int, int, str]] = []
         self.outcomes: list[object] = []
@@ -49,6 +51,9 @@ class FakeProjectView:
 
     def show_next_stage(self, name: StageName | None) -> None:
         self.next_stage = name
+
+    def set_review_available(self, available: bool) -> None:
+        self.review_available.append(available)
 
     def set_running(self, running: bool) -> None:
         self.running.append(running)
@@ -347,6 +352,77 @@ def test_stop_run_requests_stop(tmp_path: Path) -> None:
     presenter.stop_run()
 
     assert executor.stop_requested
+
+
+# --------------------------------------------------------------------------- #
+# attribution-review cross-wiring (slice 2)
+# --------------------------------------------------------------------------- #
+def _flagged_segment(project: Project) -> Segment:
+    return next(
+        seg
+        for ch in project.book.chapters
+        for ln in ch.lines
+        for seg in ln.segments
+        if seg.review_status == ReviewStatus.NEEDS_REVIEW
+    )
+
+
+def test_open_fires_on_project_loaded_hook(
+    tmp_workspace: WorkspaceStore, review_ready_project: Project, tmp_path: Path
+) -> None:
+    view = FakeProjectView()
+    presenter = _presenter(view, FakeRunExecutor(), _deps(tmp_path))
+    handed: list[WorkspaceStore] = []
+    presenter.on_project_loaded = handed.append
+
+    presenter.open(tmp_workspace.layout.root)
+
+    assert handed == [presenter._store]  # the loaded store is handed to the review panel
+
+
+def test_review_available_true_with_segments_false_without(
+    tmp_workspace: WorkspaceStore, review_ready_project: Project, tmp_path: Path
+) -> None:
+    view = FakeProjectView()
+    presenter = _presenter(view, FakeRunExecutor(), _deps(tmp_path))
+
+    presenter.open(tmp_workspace.layout.root)  # review_ready_project carries segments
+
+    assert view.review_available[-1] is True
+
+
+def test_review_available_false_when_no_segments(
+    tmp_workspace: WorkspaceStore, parse_ready_project: Project, tmp_path: Path
+) -> None:
+    view = FakeProjectView()
+    presenter = _presenter(view, FakeRunExecutor(), _deps(tmp_path))
+
+    presenter.open(tmp_workspace.layout.root)  # parse_ready_project has no segments yet
+
+    assert view.review_available[-1] is False
+
+
+def test_refresh_after_review_rerenders_needs_review_summary_from_disk(
+    tmp_workspace: WorkspaceStore, review_ready_project: Project, tmp_path: Path
+) -> None:
+    """After an on_reviewed() tick, the shell re-reads project.json and drops the resolved flag."""
+    view = FakeProjectView()
+    result = StageResult(stage=StageName.REVIEW, status=ReviewStatus.NEEDS_REVIEW)
+    presenter = _presenter(view, FakeRunExecutor(result=result), _deps(tmp_path))
+    presenter.open(tmp_workspace.layout.root)
+    presenter.start_run()  # sets _last_outcome_kind = NEEDS_REVIEW (one flagged segment on disk)
+    assert view.outcomes[-1].blockers.needs_attribution  # the pre-edit summary has the blocker
+
+    # Simulate the AttributionPresenter's edit: approve the flagged segment through ReviewService.
+    edited = tmp_workspace.load()
+    service = ReviewService(tmp_workspace, edited)
+    service.approve_attribution(_flagged_segment(edited))
+
+    presenter.refresh_after_review()  # the on_reviewed callback the app wires
+
+    latest = view.outcomes[-1]
+    assert latest.kind == RunOutcomeKind.NEEDS_REVIEW  # still blocked by the suggestion/voice
+    assert latest.blockers.needs_attribution == []  # attribution count decremented, from disk
 
 
 def test_structural_protocol_conformance() -> None:

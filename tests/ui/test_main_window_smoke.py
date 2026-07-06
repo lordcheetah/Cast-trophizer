@@ -244,6 +244,32 @@ def test_new_and_run_buttons_disable_while_running(
     assert captured == {"run": False, "stop": True, "open": False}
 
 
+def test_review_button_disabled_while_running_and_reenabled_after(
+    tmp_workspace: WorkspaceStore, review_ready_project: Project
+) -> None:
+    """The review entry point is gated on ``not running`` (guards the concurrent-write race)."""
+    window = MainWindow()
+
+    captured: dict[str, bool] = {}
+
+    class _CaptureExecutor(FakeRunExecutor):
+        def start(self, *args: object, **kwargs: object) -> None:  # type: ignore[override]
+            captured["review_mid"] = window._review_btn.isEnabled()  # after set_running(True)
+            super().start(*args, **kwargs)  # deliver the result -> on_finished re-enables
+
+    result = StageResult(stage=StageName.REVIEW, status=ReviewStatus.NEEDS_REVIEW)
+    presenter = ProjectPresenter(
+        view=window, executor=_CaptureExecutor(result=result), deps=_deps()
+    )
+    presenter.open(tmp_workspace.layout.root)
+    assert window._review_btn.isEnabled()  # enabled once the project has segments
+
+    presenter.start_run()
+
+    assert captured["review_mid"] is False  # disabled for the duration of the run
+    assert window._review_btn.isEnabled()  # re-enabled after finish (segments still present)
+
+
 def test_new_project_flow_via_presenter(tmp_path: Path, sample_epub: Path) -> None:
     window = MainWindow()
     deps = AppServiceDeps(

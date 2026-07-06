@@ -22,6 +22,13 @@ from casttrophizer.review.actions import (
     set_segment_speaker,
     unassign_voice,
 )
+from casttrophizer.review.attribution_view import (
+    SegmentRow,
+    SpeakerOption,
+    needs_review_count,
+    segment_rows,
+    speaker_options,
+)
 from casttrophizer.review.gate import (
     ReviewBlockers,
     describe_blockers,
@@ -48,4 +55,9 @@ __all__ = [
     "assign_voice_by_ids",
     "unassign_voice",
     "ReviewService",
+    "SegmentRow",
+    "SpeakerOption",
+    "segment_rows",
+    "speaker_options",
+    "needs_review_count",
 ]

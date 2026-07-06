@@ -6,9 +6,12 @@ callbacks (Open / New / Run / Stop) the app wires to presenter methods. It satis
 :class:`~casttrophizer.ui.presenter.ProjectView` protocol structurally.
 
 Scope (slice 1): open/create a project, show per-stage status for all six stages, run the
-pipeline with a live progress bar + log, Stop/Resume, and render the terminal outcome. The
-NEEDS_REVIEW blockers are shown as a **read-only summary only** — the editing panels
-(text/attribution/voice/audio) come in later slices.
+pipeline with a live progress bar + log, Stop/Resume, and render the terminal outcome.
+
+Slice 2 adds a ``QStackedWidget``: page 0 is the shell above, page 1 embeds the
+:class:`~casttrophizer.ui.attribution_panel.AttributionPanel` for attribution review, so the
+shell's live blocker summary stays visible alongside the review work. The remaining editing
+panels (text/voice/audio) come in later slices.
 """
 
 from __future__ import annotations
@@ -26,12 +29,14 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QProgressBar,
     QPushButton,
+    QStackedWidget,
     QVBoxLayout,
     QWidget,
 )
 
 from casttrophizer.app_service import RunOutcome, RunOutcomeKind, StageRow
 from casttrophizer.domain.enums import StageName
+from casttrophizer.ui.attribution_panel import AttributionPanel
 
 __all__ = ["MainWindow"]
 
@@ -53,11 +58,20 @@ class MainWindow(QMainWindow):
         self.new_requested: Callable[[str, str | None], None] = lambda _epub, _name: None
         self.run_requested: Callable[[], None] = _noop
         self.stop_requested: Callable[[], None] = _noop
+        self.review_attributions_requested: Callable[[], None] = _noop
 
         self._build_ui()
 
     # -- construction ------------------------------------------------------- #
     def _build_ui(self) -> None:
+        # A two-page stack: the slice-1 shell (page 0) and the attribution panel (page 1).
+        self._stack = QStackedWidget()
+        self._stack.addWidget(self._build_shell_page())
+        self.attribution_panel = AttributionPanel()
+        self._stack.addWidget(self.attribution_panel)
+        self.setCentralWidget(self._stack)
+
+    def _build_shell_page(self) -> QWidget:
         central = QWidget()
         root = QVBoxLayout(central)
 
@@ -101,13 +115,30 @@ class MainWindow(QMainWindow):
         self._log.setReadOnly(True)
         root.addWidget(self._log, stretch=1)
 
-        # Outcome panel (read-only).
+        # Outcome panel (read-only) + the entry point into the attribution-review page.
         self._outcome = QLabel("")
         self._outcome.setWordWrap(True)
         self._outcome.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         root.addWidget(self._outcome)
 
-        self.setCentralWidget(central)
+        review_row = QHBoxLayout()
+        self._review_btn = QPushButton("Review attributions")
+        self._review_btn.setEnabled(False)  # enabled once the project has segments
+        self._review_btn.clicked.connect(lambda: self.review_attributions_requested())
+        review_row.addWidget(self._review_btn)
+        review_row.addStretch(1)
+        root.addLayout(review_row)
+
+        return central
+
+    # -- page navigation ---------------------------------------------------- #
+    def show_shell_page(self) -> None:
+        """Switch the stack back to the slice-1 shell (page 0)."""
+        self._stack.setCurrentIndex(0)
+
+    def show_attribution_page(self) -> None:
+        """Switch the stack to the embedded attribution-review panel (page 1)."""
+        self._stack.setCurrentIndex(1)
 
     # -- intent handlers (open file dialogs, then delegate) ----------------- #
     def _on_open_clicked(self) -> None:
@@ -137,11 +168,19 @@ class MainWindow(QMainWindow):
     def show_next_stage(self, name: StageName | None) -> None:
         self._next_label.setText(f"next: {name.value if name is not None else 'complete'}")
 
+    def set_review_available(self, available: bool) -> None:
+        self._review_btn.setEnabled(available)
+
     def set_running(self, running: bool) -> None:
         self._run_btn.setEnabled(not running)
         self._stop_btn.setEnabled(running)
         self._open_btn.setEnabled(not running)
         self._new_btn.setEnabled(not running)
+        if running:
+            # Gate review navigation on ``not running`` so an edit's ReviewService save can't
+            # race the worker's project.json write (or clobber segments the run just produced).
+            # ``_on_finished -> _refresh_status -> set_review_available`` re-enables it after.
+            self._review_btn.setEnabled(False)
 
     def set_progress(self, done: int, total: int, message: str) -> None:
         if total > 0:
@@ -173,7 +212,10 @@ class MainWindow(QMainWindow):
                 return f"Complete. Output: {outcome.output_path}"
             return "Complete."
         if outcome.kind == RunOutcomeKind.NEEDS_REVIEW:
-            return f"Needs review (resolve, then Run again): {outcome.summary}"
+            return (
+                f"Needs review: {outcome.summary}. "
+                "Use 'Review attributions' to resolve them, then Run again."
+            )
         if outcome.kind == RunOutcomeKind.STOPPED:
             return "Stopped — resumable. Run again to continue."
         return f"Failed: {outcome.message}"

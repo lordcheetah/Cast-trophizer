@@ -25,6 +25,7 @@ from typing import Protocol, runtime_checkable
 from casttrophizer.app_service import (
     AppServiceDeps,
     RunOutcome,
+    RunOutcomeKind,
     build_pipeline,
     build_providers,
     create_project,
@@ -36,13 +37,20 @@ from casttrophizer.app_service import (
 from casttrophizer.app_service.status import StageRow
 from casttrophizer.config import AppConfig
 from casttrophizer.domain.enums import StageName
+from casttrophizer.domain.models import Project
 from casttrophizer.errors import CasttrophizerError, ConfigError, PreconditionError
 from casttrophizer.pipeline.runner import Pipeline
 from casttrophizer.pipeline.stage import StageResult
 from casttrophizer.providers import LLMProvider, TTSProvider
+from casttrophizer.review.gate import describe_blockers, review_blockers
 from casttrophizer.workspace.store import WorkspaceStore
 
 __all__ = ["ProjectView", "RunExecutor", "ProjectPresenter"]
+
+
+def _has_segments(project: Project) -> bool:
+    """True iff any line carries at least one segment (attribution has produced review work)."""
+    return any(ln.segments for ch in project.book.chapters for ln in ch.lines)
 
 
 @runtime_checkable
@@ -63,6 +71,10 @@ class ProjectView(Protocol):
 
     def show_next_stage(self, name: StageName | None) -> None:
         """Show which stage the next run would execute (``None`` => complete)."""
+        ...
+
+    def set_review_available(self, available: bool) -> None:
+        """Enable/disable the 'Review attributions' entry point (true once segments exist)."""
         ...
 
     def set_running(self, running: bool) -> None:
@@ -136,6 +148,12 @@ class ProjectPresenter:
         # Progress accumulation (advance emits deltas; the bar needs a running total).
         self._done = 0
         self._total = 0
+        # The kind of the last terminal outcome, so ``refresh_after_review`` knows whether the
+        # shell is currently showing a NEEDS_REVIEW blocker summary to re-render live.
+        self._last_outcome_kind: RunOutcomeKind | None = None
+        # Optional "a project (re)loaded" hook — ``ui/app.py`` wires it to
+        # ``AttributionPresenter.attach`` so the review panel always edits a fresh snapshot.
+        self.on_project_loaded: Callable[[WorkspaceStore], None] | None = None
 
     # -- intents ------------------------------------------------------------ #
     def open(self, workspace_dir: str | Path) -> None:
@@ -235,7 +253,11 @@ class ProjectPresenter:
         self._refresh_status()
         assert self._store is not None  # a run cannot start without a loaded store
         outcome = interpret_result(result, self._store, until=None, final=self._final)
+        self._last_outcome_kind = outcome.kind
         self._view.show_outcome(outcome)
+        # A run can add segments (attribute) or resolve blockers; re-attach the review panel to
+        # the fresh snapshot so it never edits stale state.
+        self._notify_project_loaded()
 
     def _on_failed(self, message: str) -> None:
         """The worker raised (not a stage FAILED result): refresh status and show the error."""
@@ -243,17 +265,47 @@ class ProjectPresenter:
         self._refresh_status()
         self._view.show_error("Run failed", message)
 
+    # -- review-panel integration ------------------------------------------- #
+    def refresh_after_review(self) -> None:
+        """Re-read the store after an attribution edit and tick the shell live.
+
+        Wired as ``AttributionPresenter.on_reviewed``: it re-pushes the stage rows / next-stage
+        pointer / review availability, and — if the shell is currently showing a NEEDS_REVIEW
+        outcome — re-renders the blocker summary from the freshly-saved project so the "N
+        attributions" line drops as the user resolves items (even while page 1 is showing).
+        """
+        if self._store is None:
+            return
+        self._refresh_status()
+        if self._last_outcome_kind == RunOutcomeKind.NEEDS_REVIEW:
+            blockers = review_blockers(self._store.load())
+            self._view.show_outcome(
+                RunOutcome(
+                    kind=RunOutcomeKind.NEEDS_REVIEW,
+                    blockers=blockers,
+                    summary=describe_blockers(blockers),
+                )
+            )
+
     # -- helpers ------------------------------------------------------------ #
     def _adopt(self, store: WorkspaceStore) -> None:
         """Adopt a freshly opened/created project and push its header + status to the view."""
         self._store = store
+        self._last_outcome_kind = None
         project = store.load()
         self._view.show_project_loaded(project.name, project.workspace_dir)
         self._refresh_status()
+        self._notify_project_loaded()
+
+    def _notify_project_loaded(self) -> None:
+        """Hand the current store to the review panel (if the app wired the hook)."""
+        if self.on_project_loaded is not None and self._store is not None:
+            self.on_project_loaded(self._store)
 
     def _refresh_status(self) -> None:
-        """Re-read the project and push its stage rows + next-stage pointer to the view."""
+        """Re-read the project and push its stage rows + next-stage + review availability."""
         assert self._store is not None
         project = self._store.load()
         self._view.show_stage_rows(stage_status_rows(project, self._pipeline))
         self._view.show_next_stage(next_stage_name(project, self._pipeline))
+        self._view.set_review_available(_has_segments(project))
