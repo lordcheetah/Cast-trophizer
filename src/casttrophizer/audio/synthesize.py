@@ -53,6 +53,7 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "STOP_POLL_INTERVAL",
     "RENDERED_STATUSES",
+    "referenced_speaker_ids",
     "unresolved_voices",
     "unresolved_speakers",
     "synthesize_chapter",
@@ -99,6 +100,17 @@ def _referenced_speaker_ids(project: Project) -> list[str]:
                 if sid is not None and sid not in seen:
                     seen[sid] = None
     return list(seen)
+
+
+def referenced_speaker_ids(project: Project) -> list[str]:
+    """Public alias over :func:`_referenced_speaker_ids` — the "is referenced" predicate.
+
+    Distinct speaker ids referenced by any non-whitespace segment, in first-seen order (a
+    ``speaker_id=None`` segment contributes the reserved narrator's id). Exposed so the voice
+    UI can render an "is referenced" column reusing the exact predicate the render precheck and
+    ``unresolved_speakers`` share, instead of re-walking segments (which would risk drift).
+    """
+    return _referenced_speaker_ids(project)
 
 
 def _resolved_clip_path(

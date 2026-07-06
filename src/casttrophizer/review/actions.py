@@ -28,7 +28,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from casttrophizer.attribution.policy import ensure_narrator, resolve_speaker
-from casttrophizer.domain.enums import ReviewStatus, SpeakerRole
+from casttrophizer.domain.enums import ReviewStatus, SpeakerRole, VoiceCategory
 from casttrophizer.domain.ids import new_id
 from casttrophizer.domain.models import (
     Line,
@@ -52,6 +52,7 @@ __all__ = [
     "assign_voice",
     "assign_voice_by_ids",
     "unassign_voice",
+    "set_speaker_category",
 ]
 
 
@@ -231,3 +232,14 @@ def unassign_voice(speaker: Speaker) -> None:
     review-complete flag (see :class:`ReviewService`).
     """
     speaker.voice_clip_id = None
+
+
+def set_speaker_category(speaker: Speaker, category: VoiceCategory) -> None:
+    """Set ``speaker.category`` (the voice bucket that drives ``--rest``/bulk default selection).
+
+    Category affects **neither** the review gate **nor** the :class:`AudioCache` key (that keys
+    on the resolved ``voice_clip_id``, never the category) — it only steers which default clip
+    ``assign-voice --rest``/bulk-assign picks — so this needs no review-flag invalidation and
+    forces no re-render.
+    """
+    speaker.category = category

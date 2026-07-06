@@ -38,6 +38,7 @@ class FakeProjectView:
         self.stage_rows: list[StageRow] | None = None
         self.next_stage: object = "UNSET"
         self.review_available: list[bool] = []
+        self.voice_available: list[bool] = []
         self.running: list[bool] = []
         self.progress: list[tuple[int, int, str]] = []
         self.outcomes: list[object] = []
@@ -54,6 +55,9 @@ class FakeProjectView:
 
     def set_review_available(self, available: bool) -> None:
         self.review_available.append(available)
+
+    def set_voice_available(self, available: bool) -> None:
+        self.voice_available.append(available)
 
     def set_running(self, running: bool) -> None:
         self.running.append(running)

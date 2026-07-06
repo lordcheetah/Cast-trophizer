@@ -49,10 +49,15 @@ from casttrophizer.app_service.outcome import RunOutcomeKind, interpret_result
 from casttrophizer.app_service.pipeline_service import build_pipeline, run_pipeline
 from casttrophizer.app_service.projects import ProjectExistsError, create_project
 from casttrophizer.app_service.status import next_stage_name, stage_status_rows
+from casttrophizer.app_service.voices import (
+    REST_CATEGORY_KEYS,
+    apply_bulk_voice,
+    plan_bulk_voice,
+)
 from casttrophizer.audio.synthesize import unresolved_speakers
 from casttrophizer.config import AppConfig
 from casttrophizer.domain.enums import ReviewStatus, StageName
-from casttrophizer.domain.models import Project, Speaker, VoiceClip
+from casttrophizer.domain.models import Project, Speaker
 from casttrophizer.errors import CasttrophizerError, ConfigError, PreconditionError
 from casttrophizer.pipeline.progress import ProgressReporter
 from casttrophizer.pipeline.stage import StageResult
@@ -424,28 +429,6 @@ def cmd_assign_voice(args: argparse.Namespace, deps: CliDeps) -> int:
     return _EXIT_OK
 
 
-#: Per-category ``--rest`` flags (the ``VoiceCategory`` members with a dedicated flag). The
-#: ``unknown`` category has no flag — it resolves straight to ``--default``.
-_REST_CATEGORY_FLAGS = ("man", "woman", "boy", "girl")
-
-
-def _resolve_category_clip(
-    category: str, args: argparse.Namespace, config: AppConfig
-) -> str | None:
-    """Resolve one voice category to a clip path: flag > env default > ``--default`` fallback.
-
-    ``--man/--woman/...`` win over the matching ``CASTTROPHIZER_VOICE_*`` env default, which
-    wins over the shared ``--default`` (which itself wins over ``CASTTROPHIZER_VOICE_DEFAULT``).
-    A category with no flag (``unknown``) or no per-category value falls back to the default;
-    returns ``None`` when nothing resolves (an uncovered category).
-    """
-    default_path = args.default or config.voice_defaults.get("default")
-    if category in _REST_CATEGORY_FLAGS:
-        flag_value = getattr(args, category)
-        return flag_value or config.voice_defaults.get(category) or default_path
-    return default_path  # unknown / any future flagless category
-
-
 def _cmd_assign_voice_rest(
     args: argparse.Namespace,
     deps: CliDeps,
@@ -454,13 +437,14 @@ def _cmd_assign_voice_rest(
 ) -> int:
     """Bulk-assign category default clips to every referenced, still-unvoiced speaker.
 
-    Targets exactly the speakers the review gate flags (``unresolved_speakers`` — shares the
-    synthesize precheck predicate). A renderable ``speaker_id=None`` segment resolves to the
-    reserved narrator, so an unvoiced narrator is a valid target here and ``--rest`` voices it.
-    Validates full coverage up front — if any target's
-    category resolves to no clip, fails without assigning anything (never leaves a referenced
-    speaker unvoiced, which would re-block the gate). Registers one shared ``VoiceClip`` per
-    distinct path (validating each path exists) and persists all assignments in a single save.
+    Delegates the resolution/targeting/apply to :mod:`casttrophizer.app_service.voices` (shared
+    with the UI). Targets exactly the speakers the review gate flags (``unresolved_speakers`` —
+    shares the synthesize precheck predicate). A renderable ``speaker_id=None`` segment resolves
+    to the reserved narrator, so an unvoiced narrator is a valid target here and ``--rest`` voices
+    it. Validates full coverage up front — if any target's category resolves to no clip, fails
+    without assigning anything (never leaves a referenced speaker unvoiced, which would re-block
+    the gate). Registers one shared ``VoiceClip`` per distinct path (validating each path exists)
+    and persists all assignments in a single save.
     """
     if args.speaker is not None or args.clip is not None:
         raise CliError(
@@ -468,28 +452,21 @@ def _cmd_assign_voice_rest(
         )
     config = deps.config or AppConfig.from_env()
 
-    targets = unresolved_speakers(project)
-    if not targets:
+    if not unresolved_speakers(project):
         print("all referenced speakers already voiced; nothing to assign")
         return _EXIT_OK
 
-    # Resolve each target's clip and collect any uncovered categories (dry run, no mutation).
-    resolved: list[tuple[Speaker, str]] = []  # (speaker, clip path)
-    uncovered: dict[str, list[str]] = {}  # category -> speaker names with no clip
-    for speaker in targets:
-        category = speaker.category.value
-        path = _resolve_category_clip(category, args, config)
-        if path is None:
-            uncovered.setdefault(category, []).append(speaker.name)
-        else:
-            resolved.append((speaker, path))
+    overrides: dict[str, str | None] = {key: getattr(args, key) for key in REST_CATEGORY_KEYS}
+    overrides["default"] = args.default
+    plan = plan_bulk_voice(project, overrides, config)
 
-    if uncovered:
+    if plan.uncovered:
         detail = "; ".join(
-            f"{category} (speakers: {', '.join(names)})" for category, names in uncovered.items()
+            f"{category} (speakers: {', '.join(names)})"
+            for category, names in plan.uncovered.items()
         )
         hint_flags = sorted(
-            f"--{category}" for category in uncovered if category in _REST_CATEGORY_FLAGS
+            f"--{category}" for category in plan.uncovered if category in REST_CATEGORY_KEYS
         )
         hint = " / ".join([*hint_flags, "--default"])  # --default always applies (covers unknown)
         raise CliError(
@@ -497,29 +474,15 @@ def _cmd_assign_voice_rest(
             code=_EXIT_ERROR,
         )
 
-    # Coverage is complete: register one shared VoiceClip per distinct path (validates each
-    # path exists, raising ValueError before anything is persisted), then batch-assign + save.
     svc = ReviewService(store, project)
-    clips_by_path: dict[str, VoiceClip] = {}
-    counts: dict[str, int] = {}
-    pairs: list[tuple[Speaker, VoiceClip]] = []
-    for speaker, path in resolved:
-        clip = clips_by_path.get(path)
-        if clip is None:
-            try:
-                clip = actions.register_voice_clip(
-                    project, path, label=f"{speaker.category.value} (default)"
-                )
-            except ValueError as exc:
-                raise CliError(str(exc), code=_EXIT_ERROR) from exc
-            clips_by_path[path] = clip
-        pairs.append((speaker, clip))
-        counts[speaker.category.value] = counts.get(speaker.category.value, 0) + 1
+    try:
+        counts = apply_bulk_voice(svc, plan)
+    except ValueError as exc:
+        raise CliError(str(exc), code=_EXIT_ERROR) from exc
 
-    svc.assign_voices(pairs)
-
+    total = sum(counts.values())
     breakdown = ", ".join(f"{category} x{n}" for category, n in sorted(counts.items()))
-    print(f"assigned defaults to {len(pairs)} speaker(s): {breakdown}")
+    print(f"assigned defaults to {total} speaker(s): {breakdown}")
     return _EXIT_OK
 
 

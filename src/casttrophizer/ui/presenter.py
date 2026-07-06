@@ -77,6 +77,10 @@ class ProjectView(Protocol):
         """Enable/disable the 'Review attributions' entry point (true once segments exist)."""
         ...
 
+    def set_voice_available(self, available: bool) -> None:
+        """Enable/disable the 'Assign voices' entry point (true once referenced speakers exist)."""
+        ...
+
     def set_running(self, running: bool) -> None:
         """Toggle the running state (enables Stop, disables Run/Open/New, etc.)."""
         ...
@@ -154,6 +158,17 @@ class ProjectPresenter:
         # Optional "a project (re)loaded" hook — ``ui/app.py`` wires it to
         # ``AttributionPresenter.attach`` so the review panel always edits a fresh snapshot.
         self.on_project_loaded: Callable[[WorkspaceStore], None] | None = None
+
+    @property
+    def store(self) -> WorkspaceStore | None:
+        """The loaded project's store, or ``None`` before a project is opened/created.
+
+        Exposed so navigation into a review panel can re-attach that panel to a **freshly
+        loaded** snapshot (see ``ui/app.py``). Both review presenters write the whole project on
+        save, so a panel must reload on entry to pick up edits the *other* panel persisted —
+        otherwise a stale whole-project write silently clobbers them.
+        """
+        return self._store
 
     # -- intents ------------------------------------------------------------ #
     def open(self, workspace_dir: str | Path) -> None:
@@ -303,9 +318,13 @@ class ProjectPresenter:
             self.on_project_loaded(self._store)
 
     def _refresh_status(self) -> None:
-        """Re-read the project and push its stage rows + next-stage + review availability."""
+        """Re-read the project and push its stage rows + next-stage + review/voice availability."""
         assert self._store is not None
         project = self._store.load()
         self._view.show_stage_rows(stage_status_rows(project, self._pipeline))
         self._view.show_next_stage(next_stage_name(project, self._pipeline))
-        self._view.set_review_available(_has_segments(project))
+        # A project with segments always has a referenced narrator, so the same predicate gates
+        # both entry points: once attribution has produced review work, there is a cast to voice.
+        has_segments = _has_segments(project)
+        self._view.set_review_available(has_segments)
+        self._view.set_voice_available(has_segments)

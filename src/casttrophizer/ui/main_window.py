@@ -37,6 +37,7 @@ from PySide6.QtWidgets import (
 from casttrophizer.app_service import RunOutcome, RunOutcomeKind, StageRow
 from casttrophizer.domain.enums import StageName
 from casttrophizer.ui.attribution_panel import AttributionPanel
+from casttrophizer.ui.voice_panel import VoicePanel
 
 __all__ = ["MainWindow"]
 
@@ -59,16 +60,20 @@ class MainWindow(QMainWindow):
         self.run_requested: Callable[[], None] = _noop
         self.stop_requested: Callable[[], None] = _noop
         self.review_attributions_requested: Callable[[], None] = _noop
+        self.assign_voices_requested: Callable[[], None] = _noop
 
         self._build_ui()
 
     # -- construction ------------------------------------------------------- #
     def _build_ui(self) -> None:
-        # A two-page stack: the slice-1 shell (page 0) and the attribution panel (page 1).
+        # A three-page stack: the slice-1 shell (page 0), the attribution panel (page 1), and
+        # the voice-assignment panel (page 2).
         self._stack = QStackedWidget()
         self._stack.addWidget(self._build_shell_page())
         self.attribution_panel = AttributionPanel()
         self._stack.addWidget(self.attribution_panel)
+        self.voice_panel = VoicePanel()
+        self._stack.addWidget(self.voice_panel)
         self.setCentralWidget(self._stack)
 
     def _build_shell_page(self) -> QWidget:
@@ -126,6 +131,10 @@ class MainWindow(QMainWindow):
         self._review_btn.setEnabled(False)  # enabled once the project has segments
         self._review_btn.clicked.connect(lambda: self.review_attributions_requested())
         review_row.addWidget(self._review_btn)
+        self._voice_btn = QPushButton("Assign voices")
+        self._voice_btn.setEnabled(False)  # enabled once the project has referenced speakers
+        self._voice_btn.clicked.connect(lambda: self.assign_voices_requested())
+        review_row.addWidget(self._voice_btn)
         review_row.addStretch(1)
         root.addLayout(review_row)
 
@@ -139,6 +148,10 @@ class MainWindow(QMainWindow):
     def show_attribution_page(self) -> None:
         """Switch the stack to the embedded attribution-review panel (page 1)."""
         self._stack.setCurrentIndex(1)
+
+    def show_voice_page(self) -> None:
+        """Switch the stack to the embedded voice-assignment panel (page 2)."""
+        self._stack.setCurrentIndex(2)
 
     # -- intent handlers (open file dialogs, then delegate) ----------------- #
     def _on_open_clicked(self) -> None:
@@ -171,16 +184,21 @@ class MainWindow(QMainWindow):
     def set_review_available(self, available: bool) -> None:
         self._review_btn.setEnabled(available)
 
+    def set_voice_available(self, available: bool) -> None:
+        self._voice_btn.setEnabled(available)
+
     def set_running(self, running: bool) -> None:
         self._run_btn.setEnabled(not running)
         self._stop_btn.setEnabled(running)
         self._open_btn.setEnabled(not running)
         self._new_btn.setEnabled(not running)
         if running:
-            # Gate review navigation on ``not running`` so an edit's ReviewService save can't
-            # race the worker's project.json write (or clobber segments the run just produced).
-            # ``_on_finished -> _refresh_status -> set_review_available`` re-enables it after.
+            # Gate review/voice navigation on ``not running`` so an edit's ReviewService save
+            # can't race the worker's project.json write (or clobber segments the run just
+            # produced). ``_on_finished -> _refresh_status -> set_review_available /
+            # set_voice_available`` re-enables them after.
             self._review_btn.setEnabled(False)
+            self._voice_btn.setEnabled(False)
 
     def set_progress(self, done: int, total: int, message: str) -> None:
         if total > 0:

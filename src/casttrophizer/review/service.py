@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from casttrophizer.domain.enums import SpeakerRole, StageName
+from casttrophizer.domain.enums import SpeakerRole, StageName, VoiceCategory
 from casttrophizer.domain.models import Line, Project, Segment, Speaker, VoiceClip
 from casttrophizer.review import actions
 from casttrophizer.review.gate import ReviewBlockers, review_blockers
@@ -152,4 +152,14 @@ class ReviewService:
         """
         actions.unassign_voice(speaker)
         self._invalidate_review()
+        self._save()
+
+    def set_speaker_category(self, speaker: Speaker, category: VoiceCategory) -> None:
+        """Set a speaker's voice category and persist — **no** review-flag invalidation.
+
+        Category steers only which default clip ``--rest``/bulk-assign picks; it touches neither
+        the review gate nor the :class:`AudioCache` key (which keys on the resolved
+        ``voice_clip_id``), so it cannot introduce a blocker and forces no re-render.
+        """
+        actions.set_speaker_category(speaker, category)
         self._save()
