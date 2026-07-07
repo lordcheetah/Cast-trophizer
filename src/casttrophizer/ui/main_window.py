@@ -37,6 +37,7 @@ from PySide6.QtWidgets import (
 from casttrophizer.app_service import RunOutcome, RunOutcomeKind, StageRow
 from casttrophizer.domain.enums import StageName
 from casttrophizer.ui.attribution_panel import AttributionPanel
+from casttrophizer.ui.suggestion_panel import SuggestionPanel
 from casttrophizer.ui.voice_panel import VoicePanel
 
 __all__ = ["MainWindow"]
@@ -59,6 +60,7 @@ class MainWindow(QMainWindow):
         self.new_requested: Callable[[str, str | None], None] = lambda _epub, _name: None
         self.run_requested: Callable[[], None] = _noop
         self.stop_requested: Callable[[], None] = _noop
+        self.review_text_requested: Callable[[], None] = _noop
         self.review_attributions_requested: Callable[[], None] = _noop
         self.assign_voices_requested: Callable[[], None] = _noop
 
@@ -66,14 +68,16 @@ class MainWindow(QMainWindow):
 
     # -- construction ------------------------------------------------------- #
     def _build_ui(self) -> None:
-        # A three-page stack: the slice-1 shell (page 0), the attribution panel (page 1), and
-        # the voice-assignment panel (page 2).
+        # A four-page stack: the slice-1 shell (page 0), the attribution panel (page 1), the
+        # voice-assignment panel (page 2), and the text-suggestion panel (page 3).
         self._stack = QStackedWidget()
         self._stack.addWidget(self._build_shell_page())
         self.attribution_panel = AttributionPanel()
         self._stack.addWidget(self.attribution_panel)
         self.voice_panel = VoicePanel()
         self._stack.addWidget(self.voice_panel)
+        self.suggestion_panel = SuggestionPanel()
+        self._stack.addWidget(self.suggestion_panel)
         self.setCentralWidget(self._stack)
 
     def _build_shell_page(self) -> QWidget:
@@ -127,6 +131,10 @@ class MainWindow(QMainWindow):
         root.addWidget(self._outcome)
 
         review_row = QHBoxLayout()
+        self._text_btn = QPushButton("Review text")
+        self._text_btn.setEnabled(False)  # enabled once the project has text suggestions
+        self._text_btn.clicked.connect(lambda: self.review_text_requested())
+        review_row.addWidget(self._text_btn)
         self._review_btn = QPushButton("Review attributions")
         self._review_btn.setEnabled(False)  # enabled once the project has segments
         self._review_btn.clicked.connect(lambda: self.review_attributions_requested())
@@ -152,6 +160,10 @@ class MainWindow(QMainWindow):
     def show_voice_page(self) -> None:
         """Switch the stack to the embedded voice-assignment panel (page 2)."""
         self._stack.setCurrentIndex(2)
+
+    def show_text_page(self) -> None:
+        """Switch the stack to the embedded text-suggestion panel (page 3)."""
+        self._stack.setCurrentIndex(3)
 
     # -- intent handlers (open file dialogs, then delegate) ----------------- #
     def _on_open_clicked(self) -> None:
@@ -181,6 +193,9 @@ class MainWindow(QMainWindow):
     def show_next_stage(self, name: StageName | None) -> None:
         self._next_label.setText(f"next: {name.value if name is not None else 'complete'}")
 
+    def set_text_available(self, available: bool) -> None:
+        self._text_btn.setEnabled(available)
+
     def set_review_available(self, available: bool) -> None:
         self._review_btn.setEnabled(available)
 
@@ -193,10 +208,11 @@ class MainWindow(QMainWindow):
         self._open_btn.setEnabled(not running)
         self._new_btn.setEnabled(not running)
         if running:
-            # Gate review/voice navigation on ``not running`` so an edit's ReviewService save
-            # can't race the worker's project.json write (or clobber segments the run just
-            # produced). ``_on_finished -> _refresh_status -> set_review_available /
-            # set_voice_available`` re-enables them after.
+            # Gate text/review/voice navigation on ``not running`` so an edit's ReviewService
+            # save can't race the worker's project.json write (or clobber segments the run just
+            # produced). ``_on_finished -> _refresh_status -> set_text_available /
+            # set_review_available / set_voice_available`` re-enables them after.
+            self._text_btn.setEnabled(False)
             self._review_btn.setEnabled(False)
             self._voice_btn.setEnabled(False)
 

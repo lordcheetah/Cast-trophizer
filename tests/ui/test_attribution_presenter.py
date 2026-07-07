@@ -23,6 +23,7 @@ from casttrophizer.domain.models import (
 from casttrophizer.domain.serialization import CURRENT_SCHEMA_VERSION
 from casttrophizer.review.attribution_view import SegmentRow, SpeakerOption
 from casttrophizer.review.gate import review_blockers
+from casttrophizer.review.service import ReviewService
 from casttrophizer.ui.attribution_presenter import AttributionPresenter, AttributionView
 from casttrophizer.workspace.store import WorkspaceStore
 
@@ -94,7 +95,7 @@ def _presenter(
     view = FakeAttributionView()
     reviewed = _Recorder()
     presenter = AttributionPresenter(view=view, on_reviewed=reviewed)
-    presenter.attach(store)
+    presenter.attach(ReviewService(store, store.load()))
     return presenter, view, reviewed
 
 

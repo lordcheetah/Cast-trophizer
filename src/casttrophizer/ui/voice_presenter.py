@@ -41,7 +41,6 @@ from casttrophizer.review.voice_view import (
     needs_voice_count,
     speaker_voice_rows,
 )
-from casttrophizer.workspace.store import WorkspaceStore
 
 __all__ = ["VoiceView", "VoicePresenter"]
 
@@ -85,13 +84,14 @@ class VoiceView(Protocol):
 
 
 class VoicePresenter:
-    """Drives voice assignment for one loaded project through a :class:`ReviewService`.
+    """Drives voice assignment for one loaded project through the shared :class:`ReviewService`.
 
-    Holds the active :class:`ReviewService` (rebuilt on every :meth:`attach` so the panel never
-    edits a stale snapshot), the needs-voice-only filter state, and the current selection index
-    into the *displayed* (filtered) rows. Contains no Qt and no voice logic — each intent looks
-    the speaker up by id and delegates to the matching ``ReviewService`` method (or, for bulk, to
-    the shared :mod:`casttrophizer.app_service.voices` planner).
+    Holds the shared :class:`ReviewService` (adopted by reference on every :meth:`attach`, so all
+    review panels edit one in-memory ``Project`` and no snapshot can diverge), the needs-voice-only
+    filter state, and the current selection index into the *displayed* (filtered) rows. Contains
+    no Qt and no voice logic — each intent looks the speaker up by id and delegates to the matching
+    ``ReviewService`` method (or, for bulk, to the shared
+    :mod:`casttrophizer.app_service.voices` planner).
     """
 
     def __init__(
@@ -110,16 +110,16 @@ class VoicePresenter:
         self._selected_id: SpeakerId | None = None  # the selected speaker (survives re-render)
 
     # -- lifecycle ---------------------------------------------------------- #
-    def attach(self, store: WorkspaceStore) -> None:
-        """Load the project from ``store``, build a fresh service, and reset the player.
+    def attach(self, service: ReviewService) -> None:
+        """Adopt the shared :class:`ReviewService` (by reference) and reset the player.
 
-        Called whenever a project is (re)loaded (via ``ProjectPresenter.on_project_loaded``); it
-        rebuilds the service on a freshly-loaded snapshot so a later run adding speakers — or a
-        re-open — never leaves the panel editing stale state, and asks the view to
+        Called whenever a project is (re)loaded (via ``ProjectPresenter.on_project_loaded``) with
+        the one service ``ProjectPresenter`` owns, so a later run adding speakers — or a re-open —
+        never leaves the panel editing stale state, and asks the view to
         :meth:`~VoiceView.stop_playback` so a clip from the previous project isn't left playing.
         Does not render until :meth:`open`.
         """
-        self._service = ReviewService(store, store.load())
+        self._service = service
         self._needs_voice_only = True
         self._selected_id = None
         self._rows = []

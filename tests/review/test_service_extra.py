@@ -12,8 +12,9 @@ from __future__ import annotations
 from pathlib import Path
 
 from casttrophizer.audio.synthesize import unresolved_voices
-from casttrophizer.domain.enums import ReviewStatus, SpeakerRole, StageName
-from casttrophizer.domain.models import Project, Segment
+from casttrophizer.domain.enums import ReviewStatus, SpeakerRole, StageName, VoiceCategory
+from casttrophizer.domain.ids import new_id
+from casttrophizer.domain.models import Line, Project, Segment, TextSuggestion
 from casttrophizer.review.gate import is_review_complete
 from casttrophizer.review.service import ReviewService
 from casttrophizer.workspace.store import WorkspaceStore
@@ -70,6 +71,226 @@ def test_set_segment_speaker_persists_and_invalidates(
     )
     assert rseg.speaker_id == alice.id
     assert rseg.review_status == ReviewStatus.APPROVED
+
+
+def test_accept_suggestion_persists_segment_propagation(
+    tmp_workspace: WorkspaceStore, review_ready_project: Project
+) -> None:
+    """Through the service, accepting fixes the segment text + resets its cache, on disk."""
+    project = review_ready_project
+    narrator = next(sp for sp in project.speakers if sp.role == SpeakerRole.NARRATOR)
+    seg = Segment(
+        id=new_id("seg"),
+        text="The narrarator spoke.",
+        speaker_id=narrator.id,
+        role=SpeakerRole.NARRATOR,
+        confidence=1.0,
+        review_status=ReviewStatus.APPROVED,
+        audio_cache_key="STALE",
+        audio_status=ReviewStatus.COMPLETED,
+    )
+    line = Line(
+        id=new_id("line"),
+        chapter_id=project.book.chapters[0].id,
+        order=99,
+        text="The narrarator spoke.",
+        segments=[seg],
+        suggestions=[
+            TextSuggestion(
+                id=new_id("sug"),
+                original="narrarator",
+                suggested="narrator",
+                reason="spellcheck",
+                confidence=0.7,
+                status=ReviewStatus.PENDING,
+            )
+        ],
+    )
+    project.book.chapters[0].lines.append(line)
+    tmp_workspace.save(project)
+
+    service = ReviewService(tmp_workspace, project)
+    service.accept_suggestion(line, line.suggestions[0].id)
+
+    reloaded = _reload(project)
+    rline = reloaded.book.chapters[0].lines[-1]
+    assert rline.text == "The narrator spoke."
+    assert rline.segments[0].text == "The narrator spoke."
+    assert rline.segments[0].audio_cache_key is None
+    assert rline.segments[0].audio_status == ReviewStatus.PENDING
+
+
+def test_edit_line_text_resegment_pops_completed_flag_and_persists(
+    tmp_workspace: WorkspaceStore, review_ready_project: Project
+) -> None:
+    """A re-segmenting line edit re-opens the gate (pops REVIEW) and persists the new text."""
+    project = review_ready_project
+    project.stage_status[str(StageName.REVIEW)] = ReviewStatus.COMPLETED
+    tmp_workspace.save(project)
+
+    service = ReviewService(tmp_workspace, project)
+    line = project.book.chapters[0].lines[0]
+    service.edit_line_text(line, '"A brand new quote," said Zed.')
+
+    reloaded = _reload(project)
+    assert str(StageName.REVIEW) not in reloaded.stage_status  # re-opened by the new quote
+    assert reloaded.book.chapters[0].lines[0].text == '"A brand new quote," said Zed.'
+
+
+# --------------------------------------------------------------------------- #
+# render-stage invalidation: a review edit that dirties a segment's audio must re-open
+# SYNTHESIZE **and** ASSEMBLE so a *post-render* correction actually re-renders + rebuilds
+# the M4B (else the runner skips the still-COMPLETED stages and keeps stale audio).
+# --------------------------------------------------------------------------- #
+def _complete_render(project: Project) -> None:
+    """Mark REVIEW + SYNTHESIZE + ASSEMBLE COMPLETED — a fully-rendered project."""
+    for stage in (StageName.REVIEW, StageName.SYNTHESIZE, StageName.ASSEMBLE):
+        project.stage_status[str(stage)] = ReviewStatus.COMPLETED
+
+
+def _render_reopened(project: Project) -> bool:
+    """True iff BOTH render stages were popped (the next run re-renders + reassembles)."""
+    return (
+        str(StageName.SYNTHESIZE) not in project.stage_status
+        and str(StageName.ASSEMBLE) not in project.stage_status
+    )
+
+
+def test_edit_line_text_after_render_reopens_synth_and_assemble(
+    tmp_workspace: WorkspaceStore, review_ready_project: Project
+) -> None:
+    """The reviewer's post-render footgun: editing a line on a finished M4B must re-render."""
+    project = review_ready_project
+    _complete_render(project)
+    tmp_workspace.save(project)
+
+    service = ReviewService(tmp_workspace, project)
+    service.edit_line_text(project.book.chapters[0].lines[0], '"A brand new quote," said Zed.')
+
+    assert _render_reopened(_reload(project)), "post-render line edit left synth/assemble complete"
+
+
+def test_accept_suggestion_dirtying_segment_after_render_reopens_synth_and_assemble(
+    tmp_workspace: WorkspaceStore, review_ready_project: Project
+) -> None:
+    """Accepting a correction that reaches a segment must re-open the render stages."""
+    project = review_ready_project
+    narrator = next(sp for sp in project.speakers if sp.role == SpeakerRole.NARRATOR)
+    line = Line(
+        id=new_id("line"),
+        chapter_id=project.book.chapters[0].id,
+        order=99,
+        text="The narrarator spoke.",
+        segments=[
+            Segment(
+                id=new_id("seg"),
+                text="The narrarator spoke.",
+                speaker_id=narrator.id,
+                role=SpeakerRole.NARRATOR,
+                confidence=1.0,
+                review_status=ReviewStatus.APPROVED,
+                audio_cache_key="STALE",
+                audio_status=ReviewStatus.COMPLETED,
+            )
+        ],
+        suggestions=[
+            TextSuggestion(
+                id=new_id("sug"),
+                original="narrarator",
+                suggested="narrator",
+                reason="spellcheck",
+                confidence=0.7,
+                status=ReviewStatus.PENDING,
+            )
+        ],
+    )
+    project.book.chapters[0].lines.append(line)
+    _complete_render(project)
+    tmp_workspace.save(project)
+
+    service = ReviewService(tmp_workspace, project)
+    service.accept_suggestion(line, line.suggestions[0].id)
+
+    assert _render_reopened(_reload(project))
+
+
+def test_accept_suggestion_not_reaching_a_segment_leaves_render_complete(
+    tmp_workspace: WorkspaceStore, review_ready_project: Project
+) -> None:
+    """A line-text-only accept (token in no segment) changes no audio -> render stays complete."""
+    project = review_ready_project
+    narrator = next(sp for sp in project.speakers if sp.role == SpeakerRole.NARRATOR)
+    line = Line(
+        id=new_id("line"),
+        chapter_id=project.book.chapters[0].id,
+        order=98,
+        text="A stage cue [note].",
+        segments=[
+            Segment(
+                id=new_id("seg"),
+                text="A stage cue.",  # segment does NOT contain the suggested token
+                speaker_id=narrator.id,
+                role=SpeakerRole.NARRATOR,
+                confidence=1.0,
+                review_status=ReviewStatus.APPROVED,
+                audio_cache_key="KEEP",
+                audio_status=ReviewStatus.COMPLETED,
+            )
+        ],
+        suggestions=[
+            TextSuggestion(
+                id=new_id("sug"),
+                original="[note]",
+                suggested="",
+                reason="ocr-artifact",
+                confidence=0.9,
+                status=ReviewStatus.PENDING,
+            )
+        ],
+    )
+    project.book.chapters[0].lines.append(line)
+    _complete_render(project)
+    tmp_workspace.save(project)
+
+    service = ReviewService(tmp_workspace, project)
+    service.accept_suggestion(line, line.suggestions[0].id)
+
+    reloaded = _reload(project)
+    assert not _render_reopened(reloaded)  # no segment dirtied -> render still complete
+    assert reloaded.book.chapters[0].lines[-1].segments[0].audio_cache_key == "KEEP"
+
+
+def test_set_segment_speaker_after_render_reopens_synth_and_assemble(
+    tmp_workspace: WorkspaceStore, review_ready_project: Project
+) -> None:
+    """A speaker change alters the segment's resolved voice -> its cache key -> must re-render."""
+    project = review_ready_project
+    _complete_render(project)
+    tmp_workspace.save(project)
+
+    service = ReviewService(tmp_workspace, project)
+    seg = _needs_review_segment(project)
+    alice = next(sp for sp in project.speakers if sp.name == "Alice")
+    service.set_segment_speaker(seg, speaker_id=alice.id, role=SpeakerRole.CHARACTER)
+
+    assert _render_reopened(_reload(project))
+
+
+def test_set_speaker_category_leaves_render_complete(
+    tmp_workspace: WorkspaceStore, review_ready_project: Project
+) -> None:
+    """Category is not in the audio cache key -> setting it must NOT re-open the render stages."""
+    project = review_ready_project
+    _complete_render(project)
+    tmp_workspace.save(project)
+
+    service = ReviewService(tmp_workspace, project)
+    speaker = next(sp for sp in project.speakers if sp.name == "Alice")
+    service.set_speaker_category(speaker, VoiceCategory.WOMAN)
+
+    reloaded = _reload(project)
+    assert not _render_reopened(reloaded)  # cache-neutral edit -> render untouched
+    assert str(StageName.SYNTHESIZE) in reloaded.stage_status
 
 
 def test_reject_suggestion_persists(

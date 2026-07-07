@@ -8,19 +8,20 @@ operations trivially unit-testable without a store.
 Speaker creation/lookup reuses ``attribution.policy.resolve_speaker``/``ensure_narrator``
 so the one case-insensitive matching rule is shared (no second implementation).
 
-**Known limitation (text-edit propagation DEFERRED):** ``accept_suggestion`` and
-``edit_line_text`` mutate ``line.text`` *only*; ``line.segments`` (what the synthesize
-stage actually speaks) are left untouched — the line is NOT re-segmented. Whether/how a
-text edit propagates to the spanning segment is a later UI-phase design decision. A user
-"fixing" a typo in review may therefore not change spoken audio yet.
+**Text-edit propagation (LIVE):** ``accept_suggestion`` fixes the matching **segment** text
+(not just ``line.text``) so the correction reaches the rendered audio, and ``edit_line_text``
+**re-segments** the whole line (via
+:func:`~casttrophizer.attribution.segmentation.build_line_segments`) so a free-text rewrite is
+re-spoken — its quotes returning to NEEDS_REVIEW for manual re-attribution (the review layer
+never calls the LLM). See each function for the exact rule.
 
-**Cache consequence (NOTE only — not built here):** the attribution/voice actions change
-inputs that feed :meth:`~casttrophizer.workspace.audio_cache.AudioCache.key_for` (a
-segment's resolved ``voice_clip_id``). ``set_segment_speaker`` / ``reassign_*`` /
-``assign_voice`` / ``unassign_voice`` therefore change that key, so the synthesize stage
-re-renders only the affected segments on its next run. No review action touches the cache
-or deletes WAVs — the key recomputation in ``synthesize_chapter`` is the entire
-invalidation mechanism.
+**Cache consequence:** the attribution/voice actions change inputs that feed
+:meth:`~casttrophizer.workspace.audio_cache.AudioCache.key_for` (a segment's resolved
+``voice_clip_id``); ``accept_suggestion`` / ``edit_line_text`` change ``segment.text`` (the
+other keyed input). Either way the recomputed key differs, so the synthesize stage re-renders
+only the affected segments on its next run. The text actions additionally null the touched
+segment's stale ``audio_cache_key`` (and reset ``audio_status`` to PENDING), symmetric with the
+synth FAILED branch, so the assemble stage never stitches an out-of-date WAV.
 """
 
 from __future__ import annotations
@@ -28,6 +29,8 @@ from __future__ import annotations
 from pathlib import Path
 
 from casttrophizer.attribution.policy import ensure_narrator, resolve_speaker
+from casttrophizer.attribution.segmentation import build_line_segments
+from casttrophizer.attribution.segmenter import QuoteSegmenter, Segmenter
 from casttrophizer.domain.enums import ReviewStatus, SpeakerRole, VoiceCategory
 from casttrophizer.domain.ids import new_id
 from casttrophizer.domain.models import (
@@ -66,7 +69,7 @@ def _find_suggestion(line: Line, suggestion_id: str) -> TextSuggestion:
     raise ValueError(f"no suggestion {suggestion_id!r} on line {line.id!r}")
 
 
-def accept_suggestion(line: Line, suggestion_id: str) -> None:
+def accept_suggestion(line: Line, suggestion_id: str) -> bool:
     """Apply a suggestion by replacing its ``original`` token with ``suggested`` in the line.
 
     A surfaced (PENDING) suggestion stores the specific TOKEN being corrected in
@@ -75,13 +78,34 @@ def accept_suggestion(line: Line, suggestion_id: str) -> None:
     overwriting the whole line (which would drop the rest of the sentence). A whole-line
     suggestion (``original`` == the full line) still works: replacing it swaps the line.
 
-    Mutates ``line.text`` only — ``line.segments`` are NOT re-derived (see module docstring:
-    text-edit propagation is deferred). Raises ``ValueError`` if the suggestion id is not on
-    the line.
+    **Propagates to audio:** the fix also reaches the spoken :class:`Segment`. We apply the same
+    first-occurrence ``replace(original, suggested, 1)`` to the **first** segment whose text
+    contains ``original`` and null that segment's ``audio_cache_key`` (``audio_status`` ->
+    PENDING) so it re-renders on the next synth pass. Rules for the ambiguous cases:
+
+    * ``original`` in exactly one segment (normal): that segment is fixed and re-renders.
+    * ``original`` in no segment (already-diverged text, a token straddling a narration/quote
+      boundary, or a pre-attribution line with no segments): ``line.segments`` untouched — the
+      ``line.text`` fix still stands; nothing spoken carries the token, so nothing to re-render.
+    * ``original`` in multiple segments / twice in one segment: only the **first containing**
+      segment is edited, and ``replace(..., 1)`` fixes only its first occurrence — deterministic,
+      mirroring the line-level rule.
+
+    Returns ``True`` iff it **dirtied a segment** (the audio-changing case), so the caller can
+    re-open the render stages; the line-text-only path returns ``False`` (nothing spoken changed).
+    Attribution is untouched (a spelling fix does not change who speaks). Raises ``ValueError``
+    if the suggestion id is not on the line.
     """
     suggestion = _find_suggestion(line, suggestion_id)
     line.text = line.text.replace(suggestion.original, suggestion.suggested, 1)
     suggestion.status = ReviewStatus.APPROVED
+    for segment in line.segments:
+        if suggestion.original in segment.text:
+            segment.text = segment.text.replace(suggestion.original, suggestion.suggested, 1)
+            segment.audio_cache_key = None
+            segment.audio_status = ReviewStatus.PENDING
+            return True
+    return False
 
 
 def reject_suggestion(line: Line, suggestion_id: str) -> None:
@@ -93,14 +117,42 @@ def reject_suggestion(line: Line, suggestion_id: str) -> None:
     suggestion.status = ReviewStatus.REJECTED
 
 
-def edit_line_text(line: Line, new_text: str) -> None:
-    """Set ``line.text`` to a user-typed value (free-form correction).
+def edit_line_text(
+    line: Line,
+    new_text: str,
+    project: Project,
+    *,
+    segmenter: Segmenter | None = None,
+) -> bool:
+    """Set ``line.text`` to a user-typed value and **re-segment** the line. Returns re-segmented?
 
-    Does NOT touch ``line.segments`` — editing a line's text after attribution does not
-    auto-resegment (see module docstring). The text shown in review is ``line.text``;
-    ``segment.text`` is what the synthesize stage renders.
+    A whole-line rewrite cannot be token-mapped onto the old segments, so we rebuild them from
+    scratch via :func:`~casttrophizer.attribution.segmentation.build_line_segments` (offline; no
+    LLM): narration -> APPROVED narrator, quote -> **NEEDS_REVIEW** (``speaker_id=None``). The new
+    segments carry ``None`` cache keys, so they re-render on the next synth pass.
+
+    This **re-opens attribution** (criterion 1) for the line's quotes — each new quote segment is
+    NEEDS_REVIEW and re-appears in the attribution panel. Re-attribution is **manual**: this
+    module is pure/offline and never calls the LLM, so new quotes sit at narrator-fallback until
+    the user re-reviews. (Full-re-segment discards any careful per-quote attribution on the line
+    — the accepted cost of not span-mapping the edit.)
+
+    No-op guard: if the new spans' texts equal the current segments' texts in order (e.g. a
+    whitespace-only edit), **mutate nothing** — leave ``line.text``/``line.segments`` untouched,
+    create no narrator, and return ``False`` — an inert edit neither re-opens attribution nor
+    forces a re-render. Otherwise set the text, rebuild the segments, and return ``True``.
+    ``project`` supplies the reserved narrator (via ``ensure_narrator``, only on a real rebuild);
+    ``segmenter`` defaults to a :class:`~casttrophizer.attribution.segmenter.QuoteSegmenter`.
     """
+    seg = segmenter or QuoteSegmenter()
+    # Decide the no-op FIRST (span texts depend only on the split, not the narrator), so an inert
+    # edit doesn't set ``line.text`` or append a narrator as a side effect.
+    span_texts = [span.text for span in seg.split(new_text)]
+    if span_texts == [s.text for s in line.segments]:
+        return False  # inert edit (e.g. whitespace-only): keep everything as-is
     line.text = new_text
+    line.segments = build_line_segments(new_text, ensure_narrator(project), seg)
+    return True
 
 
 # --------------------------------------------------------------------------- #

@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QEvent, Qt
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -73,9 +73,11 @@ class AttributionPanel(QWidget):
         header.addWidget(self._progress)
         root.addLayout(header)
 
-        # The flat segment list.
+        # The flat segment list. It takes focus after a selection and would otherwise eat the
+        # nav letter keys (N/J/P/K) for its own type-ahead search, so we filter its key events.
         self._list = QListWidget()
         self._list.currentRowChanged.connect(self._on_current_row_changed)
+        self._list.installEventFilter(self)
         root.addWidget(self._list, stretch=1)
 
         # Per-selection action row.
@@ -144,9 +146,8 @@ class AttributionPanel(QWidget):
             self.reassign_new_requested(seg_id, name)
 
     # -- keyboard navigation ------------------------------------------------ #
-    def keyPressEvent(self, event: object) -> None:  # noqa: N802 (Qt override)
-        """N/J -> next flagged, P/K -> previous flagged, Enter -> approve the selection."""
-        key = event.key()  # type: ignore[attr-defined]
+    def _handle_nav_key(self, key: object) -> bool:
+        """N/J -> next flagged, P/K -> previous flagged, Enter -> approve. True iff consumed."""
         if key in (Qt.Key.Key_N, Qt.Key.Key_J):
             self.next_flagged_requested()
         elif key in (Qt.Key.Key_P, Qt.Key.Key_K):
@@ -154,7 +155,20 @@ class AttributionPanel(QWidget):
         elif key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
             self._on_approve()
         else:
+            return False
+        return True
+
+    def keyPressEvent(self, event: object) -> None:  # noqa: N802 (Qt override)
+        """Handle nav keys when the panel itself has focus (see also :meth:`eventFilter`)."""
+        if not self._handle_nav_key(event.key()):  # type: ignore[attr-defined]
             super().keyPressEvent(event)  # type: ignore[arg-type]
+
+    def eventFilter(self, watched: object, event: object) -> bool:  # noqa: N802 (Qt override)
+        """Intercept nav keys on the focused list before its type-ahead search swallows them."""
+        if watched is self._list and event.type() == QEvent.Type.KeyPress:  # type: ignore[attr-defined]
+            if self._handle_nav_key(event.key()):  # type: ignore[attr-defined]
+                return True
+        return super().eventFilter(watched, event)  # type: ignore[arg-type]
 
     # -- AttributionView protocol ------------------------------------------- #
     def show_segments(self, rows: list[SegmentRow]) -> None:

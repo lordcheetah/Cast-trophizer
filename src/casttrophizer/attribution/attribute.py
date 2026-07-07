@@ -26,9 +26,9 @@ stage can return FAILED.
 from __future__ import annotations
 
 from casttrophizer.attribution.policy import resolve_speaker, review_status_for
-from casttrophizer.attribution.segmenter import KIND_QUOTE, Segmenter
+from casttrophizer.attribution.segmentation import build_line_segments
+from casttrophizer.attribution.segmenter import Segmenter
 from casttrophizer.domain.enums import ReviewStatus, SpeakerRole
-from casttrophizer.domain.ids import new_id
 from casttrophizer.domain.models import Chapter, Line, Project, Segment, Speaker
 from casttrophizer.errors import LLMProviderError
 from casttrophizer.providers.base import AttributionCandidate, LLMProvider
@@ -72,34 +72,16 @@ def _attribute_window(
     threshold: float,
 ) -> None:
     """Segment ``window``'s lines, then attribute their quote segments in one LLM call."""
-    # Step 1: segment every line; narration -> APPROVED narrator, quote -> provisional.
+    # Step 1: segment every line (shared offline builder; narration -> APPROVED narrator, quote
+    # -> provisional NEEDS_REVIEW), then re-derive the quote maps from the built candidates.
     quote_segments: dict[str, Segment] = {}  # segment id -> the quote Segment
     quote_owner: dict[str, Line] = {}  # segment id -> the line it came from (for context)
     for line in window:
-        built: list[Segment] = []
-        for span in segmenter.split(line.text):
-            if span.kind == KIND_QUOTE:
-                seg = Segment(
-                    id=new_id("seg"),
-                    text=span.text,
-                    speaker_id=None,  # provisional; resolved by the LLM below
-                    role=SpeakerRole.NARRATOR,
-                    confidence=0.0,
-                    review_status=ReviewStatus.NEEDS_REVIEW,
-                )
+        line.segments = build_line_segments(line.text, narrator, segmenter)
+        for seg in line.segments:
+            if seg.review_status == ReviewStatus.NEEDS_REVIEW:  # a provisional quote candidate
                 quote_segments[seg.id] = seg
                 quote_owner[seg.id] = line
-            else:
-                seg = Segment(
-                    id=new_id("seg"),
-                    text=span.text,
-                    speaker_id=narrator.id,
-                    role=SpeakerRole.NARRATOR,
-                    confidence=1.0,
-                    review_status=ReviewStatus.APPROVED,
-                )
-            built.append(seg)
-        line.segments = built
 
     if not quote_segments:
         return  # all-narration window -> no LLM call

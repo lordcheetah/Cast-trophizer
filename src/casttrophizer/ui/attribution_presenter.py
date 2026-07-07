@@ -31,7 +31,6 @@ from casttrophizer.review.attribution_view import (
     speaker_options,
 )
 from casttrophizer.review.service import ReviewService
-from casttrophizer.workspace.store import WorkspaceStore
 
 __all__ = ["AttributionView", "AttributionPresenter"]
 
@@ -66,12 +65,13 @@ class AttributionView(Protocol):
 
 
 class AttributionPresenter:
-    """Drives attribution review for one loaded project through a :class:`ReviewService`.
+    """Drives attribution review for one loaded project through the shared :class:`ReviewService`.
 
-    Holds the active :class:`ReviewService` (rebuilt on every :meth:`attach` so the panel never
-    edits a stale snapshot), the needs-review-only filter state, and the current selection index
-    into the *displayed* (filtered) rows. Contains no Qt and no attribution logic — each intent
-    looks the segment up by id and delegates to the matching ``ReviewService`` method.
+    Holds the shared :class:`ReviewService` (adopted by reference on every :meth:`attach`, so all
+    review panels edit one in-memory ``Project`` and no snapshot can diverge), the
+    needs-review-only filter state, and the current selection index into the *displayed*
+    (filtered) rows. Contains no Qt and no attribution logic — each intent looks the segment up by
+    id and delegates to the matching ``ReviewService`` method.
     """
 
     def __init__(self, view: AttributionView, *, on_reviewed: Callable[[], None]) -> None:
@@ -83,14 +83,15 @@ class AttributionPresenter:
         self._selected = -1  # index into ``self._rows``; -1 == nothing selected
 
     # -- lifecycle ---------------------------------------------------------- #
-    def attach(self, store: WorkspaceStore) -> None:
-        """Load the project from ``store`` and build a fresh :class:`ReviewService`.
+    def attach(self, service: ReviewService) -> None:
+        """Adopt the shared :class:`ReviewService` (by reference) and reset the view state.
 
-        Called whenever a project is (re)loaded (via ``ProjectPresenter.on_project_loaded``); it
-        rebuilds the service on a freshly-loaded snapshot so a later run adding segments — or a
-        re-open — never leaves the panel editing stale state. Does not render until :meth:`open`.
+        Called whenever a project is (re)loaded (via ``ProjectPresenter.on_project_loaded``) with
+        the one service ``ProjectPresenter`` owns, so a later run adding segments — or a re-open —
+        never leaves the panel editing stale state and the voice panel's concurrent edits are
+        visible on the same object. Does not render until :meth:`open`.
         """
-        self._service = ReviewService(store, store.load())
+        self._service = service
         self._needs_review_only = True
         self._selected = -1
         self._rows = []

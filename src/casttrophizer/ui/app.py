@@ -15,12 +15,13 @@ import sys
 from PySide6.QtWidgets import QApplication
 
 from casttrophizer.app_service import AppServiceDeps
+from casttrophizer.review.service import ReviewService
 from casttrophizer.ui.attribution_presenter import AttributionPresenter
 from casttrophizer.ui.main_window import MainWindow
 from casttrophizer.ui.presenter import ProjectPresenter
 from casttrophizer.ui.run_executor import QtRunExecutor
+from casttrophizer.ui.suggestion_presenter import SuggestionPresenter
 from casttrophizer.ui.voice_presenter import VoicePresenter
-from casttrophizer.workspace.store import WorkspaceStore
 
 __all__ = ["main"]
 
@@ -36,8 +37,8 @@ def main(argv: list[str] | None = None) -> int:
     presenter = ProjectPresenter(view=window, executor=executor, deps=deps)
 
     # The attribution-review panel + its Qt-free presenter (slice 2). ``on_reviewed`` ticks the
-    # shell's live blocker summary; ``on_project_loaded`` re-attaches a fresh ReviewService
-    # snapshot whenever a project loads or a run finishes.
+    # shell's live blocker summary; ``on_project_loaded`` hands it the shared ReviewService
+    # whenever a project loads or a run finishes.
     panel = window.attribution_panel
     attribution_presenter = AttributionPresenter(
         view=panel, on_reviewed=presenter.refresh_after_review
@@ -52,12 +53,22 @@ def main(argv: list[str] | None = None) -> int:
         on_reviewed=presenter.refresh_after_review,
     )
 
-    # Combine the load hook so BOTH review panels re-attach a fresh ReviewService snapshot on
-    # every project load / run finish, and the voice panel's player is reset on project switch
-    # (voice ``attach`` calls ``view.stop_playback()``).
-    def _on_project_loaded(store: WorkspaceStore) -> None:
-        attribution_presenter.attach(store)
-        voice_presenter.attach(store)
+    # The text-suggestion review panel + its Qt-free presenter (slice 4). ``on_reviewed`` reuses
+    # the same live-blocker refresh (accepting a suggestion / editing a line can move criterion 1
+    # and 2 counts).
+    suggestion_panel = window.suggestion_panel
+    suggestion_presenter = SuggestionPresenter(
+        view=suggestion_panel, on_reviewed=presenter.refresh_after_review
+    )
+
+    # One load hook attaches ALL THREE review panels to the single shared ReviewService on every
+    # project load / run finish, so they edit one in-memory Project by reference — no per-panel
+    # snapshot can diverge, so no whole-project save can clobber another panel's edit. The voice
+    # panel's player is reset on project switch (its ``attach`` calls ``view.stop_playback()``).
+    def _on_project_loaded(service: ReviewService) -> None:
+        attribution_presenter.attach(service)
+        voice_presenter.attach(service)
+        suggestion_presenter.attach(service)
 
     presenter.on_project_loaded = _on_project_loaded
 
@@ -67,27 +78,27 @@ def main(argv: list[str] | None = None) -> int:
     window.run_requested = presenter.start_run
     window.stop_requested = presenter.stop_run
 
-    # Navigate into a review page. Re-attach the entering panel to a freshly-loaded snapshot
-    # first: both review presenters persist the whole project on save, so without a reload the
-    # panel you enter would edit state from the last project-load and its next save would clobber
-    # edits the *other* panel made in between (e.g. approve an attribution -> erase a voice just
-    # assigned). Re-attaching on entry makes navigation a reload, so both panels' edits survive.
+    # Navigate into a review page. No re-attach is needed: all three panels already share the one
+    # ReviewService (attached on project load / run finish), so entering a page just re-renders
+    # from the live shared Project and the shell blocker summary ticks off ``on_reviewed``.
     def _open_review_page() -> None:
-        if presenter.store is not None:
-            attribution_presenter.attach(presenter.store)
         attribution_presenter.open()
         window.show_attribution_page()
 
     def _open_voice_page() -> None:
-        if presenter.store is not None:
-            voice_presenter.attach(presenter.store)
         voice_presenter.open()
         window.show_voice_page()
 
+    def _open_text_page() -> None:
+        suggestion_presenter.open()
+        window.show_text_page()
+
+    window.review_text_requested = _open_text_page
     window.review_attributions_requested = _open_review_page
     window.assign_voices_requested = _open_voice_page
     panel.back_requested = window.show_shell_page
     voice_panel.back_requested = window.show_shell_page
+    suggestion_panel.back_requested = window.show_shell_page
 
     # Wire the attribution panel's intents to the attribution presenter.
     panel.filter_changed = attribution_presenter.set_filter
@@ -108,6 +119,15 @@ def main(argv: list[str] | None = None) -> int:
     voice_panel.audition_path_requested = voice_presenter.audition_path
     voice_panel.bulk_assign_requested = voice_presenter.bulk_assign_by_category
     voice_panel.selection_changed = voice_presenter.set_selected
+
+    # Wire the suggestion panel's intents to the suggestion presenter.
+    suggestion_panel.filter_changed = suggestion_presenter.set_filter
+    suggestion_panel.accept_requested = suggestion_presenter.accept
+    suggestion_panel.reject_requested = suggestion_presenter.reject
+    suggestion_panel.edit_line_requested = suggestion_presenter.edit_line
+    suggestion_panel.next_pending_requested = suggestion_presenter.next_pending
+    suggestion_panel.prev_pending_requested = suggestion_presenter.prev_pending
+    suggestion_panel.selection_changed = suggestion_presenter.set_selected
 
     window.show()
     return app.exec()

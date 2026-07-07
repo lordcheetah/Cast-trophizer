@@ -31,6 +31,7 @@ from casttrophizer.domain.models import (
     VoiceClip,
 )
 from casttrophizer.domain.serialization import CURRENT_SCHEMA_VERSION
+from casttrophizer.review.service import ReviewService
 from casttrophizer.review.voice_view import CategoryOption, SpeakerVoiceRow
 from casttrophizer.ui.voice_presenter import VoicePresenter, VoiceView
 from casttrophizer.workspace.store import WorkspaceStore
@@ -183,7 +184,7 @@ def _presenter(store: WorkspaceStore) -> tuple[VoicePresenter, FakeVoiceView, _R
     view = FakeVoiceView()
     reviewed = _Recorder()
     presenter = VoicePresenter(view=view, config=AppConfig(), on_reviewed=reviewed)
-    presenter.attach(store)
+    presenter.attach(ReviewService(store, store.load()))
     return presenter, view, reviewed
 
 

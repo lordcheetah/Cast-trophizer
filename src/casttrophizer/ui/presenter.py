@@ -43,6 +43,7 @@ from casttrophizer.pipeline.runner import Pipeline
 from casttrophizer.pipeline.stage import StageResult
 from casttrophizer.providers import LLMProvider, TTSProvider
 from casttrophizer.review.gate import describe_blockers, review_blockers
+from casttrophizer.review.service import ReviewService
 from casttrophizer.workspace.store import WorkspaceStore
 
 __all__ = ["ProjectView", "RunExecutor", "ProjectPresenter"]
@@ -51,6 +52,17 @@ __all__ = ["ProjectView", "RunExecutor", "ProjectPresenter"]
 def _has_segments(project: Project) -> bool:
     """True iff any line carries at least one segment (attribution has produced review work)."""
     return any(ln.segments for ch in project.book.chapters for ln in ch.lines)
+
+
+def _has_suggestions(project: Project) -> bool:
+    """True iff any line carries a text suggestion (text review has work to surface).
+
+    Suggestions appear after the correct stage — **before** attribute produces segments — so
+    this (not ``_has_segments``) gates the 'Review text' entry: the user can triage text as
+    soon as corrections land. Resolved suggestions still count so the panel stays reachable for
+    a free-text line edit.
+    """
+    return any(ln.suggestions for ch in project.book.chapters for ln in ch.lines)
 
 
 @runtime_checkable
@@ -79,6 +91,10 @@ class ProjectView(Protocol):
 
     def set_voice_available(self, available: bool) -> None:
         """Enable/disable the 'Assign voices' entry point (true once referenced speakers exist)."""
+        ...
+
+    def set_text_available(self, available: bool) -> None:
+        """Enable/disable the 'Review text' entry point (true once suggestions exist)."""
         ...
 
     def set_running(self, running: bool) -> None:
@@ -147,6 +163,10 @@ class ProjectPresenter:
         self._executor = executor
         self._deps = deps
         self._store: WorkspaceStore | None = None
+        # The single, shared review service (over one in-memory Project) handed to all three
+        # review panels. Rebuilt from disk on project load / run finish so a snapshot never
+        # diverges — one Project, one save path, clobber impossible by construction.
+        self._service: ReviewService | None = None
         self._pipeline: Pipeline = build_pipeline(deps)
         self._final: StageName = self._pipeline.stages[-1].name
         # Progress accumulation (advance emits deltas; the bar needs a running total).
@@ -155,20 +175,19 @@ class ProjectPresenter:
         # The kind of the last terminal outcome, so ``refresh_after_review`` knows whether the
         # shell is currently showing a NEEDS_REVIEW blocker summary to re-render live.
         self._last_outcome_kind: RunOutcomeKind | None = None
-        # Optional "a project (re)loaded" hook — ``ui/app.py`` wires it to
-        # ``AttributionPresenter.attach`` so the review panel always edits a fresh snapshot.
-        self.on_project_loaded: Callable[[WorkspaceStore], None] | None = None
+        # Optional "a project (re)loaded" hook — ``ui/app.py`` wires it to attach the shared
+        # ``ReviewService`` to all three review panels so they edit one Project by reference.
+        self.on_project_loaded: Callable[[ReviewService], None] | None = None
 
     @property
-    def store(self) -> WorkspaceStore | None:
-        """The loaded project's store, or ``None`` before a project is opened/created.
+    def service(self) -> ReviewService | None:
+        """The shared :class:`ReviewService`, or ``None`` before a project is opened/created.
 
-        Exposed so navigation into a review panel can re-attach that panel to a **freshly
-        loaded** snapshot (see ``ui/app.py``). Both review presenters write the whole project on
-        save, so a panel must reload on entry to pick up edits the *other* panel persisted —
-        otherwise a stale whole-project write silently clobbers them.
+        All three review panels edit this one service (by reference), so there are no per-panel
+        snapshots to diverge and no whole-project write can clobber another panel's edit. It is
+        rebuilt from disk at the two authoritative points (project load, run finish).
         """
-        return self._store
+        return self._service
 
     # -- intents ------------------------------------------------------------ #
     def open(self, workspace_dir: str | Path) -> None:
@@ -270,15 +289,23 @@ class ProjectPresenter:
         outcome = interpret_result(result, self._store, until=None, final=self._final)
         self._last_outcome_kind = outcome.kind
         self._view.show_outcome(outcome)
-        # A run can add segments (attribute) or resolve blockers; re-attach the review panel to
-        # the fresh snapshot so it never edits stale state.
+        # A run can add segments (attribute) or resolve blockers; rebuild the shared service from
+        # disk and re-attach every review panel so none edits pre-run state.
+        self._rebuild_service()
         self._notify_project_loaded()
 
     def _on_failed(self, message: str) -> None:
-        """The worker raised (not a stage FAILED result): refresh status and show the error."""
+        """The worker raised (not a stage FAILED result): refresh status and show the error.
+
+        A failed run may have partially mutated ``project.json`` before raising, so — like
+        ``_on_finished`` — rebuild the shared service from disk and re-attach the panels; leaving
+        the pre-run snapshot in place would let a later edit clobber whatever the run did persist.
+        """
         self._view.set_running(False)
         self._refresh_status()
         self._view.show_error("Run failed", message)
+        self._rebuild_service()
+        self._notify_project_loaded()
 
     # -- review-panel integration ------------------------------------------- #
     def refresh_after_review(self) -> None:
@@ -289,11 +316,11 @@ class ProjectPresenter:
         outcome — re-renders the blocker summary from the freshly-saved project so the "N
         attributions" line drops as the user resolves items (even while page 1 is showing).
         """
-        if self._store is None:
+        if self._service is None:
             return
         self._refresh_status()
         if self._last_outcome_kind == RunOutcomeKind.NEEDS_REVIEW:
-            blockers = review_blockers(self._store.load())
+            blockers = review_blockers(self._service.project)
             self._view.show_outcome(
                 RunOutcome(
                     kind=RunOutcomeKind.NEEDS_REVIEW,
@@ -310,15 +337,26 @@ class ProjectPresenter:
         project = store.load()
         self._view.show_project_loaded(project.name, project.workspace_dir)
         self._refresh_status()
+        self._rebuild_service()
         self._notify_project_loaded()
 
+    def _rebuild_service(self) -> None:
+        """Rebuild the shared :class:`ReviewService` from a freshly-loaded snapshot.
+
+        Called at the authoritative points (open/create in :meth:`_adopt`, and both terminal
+        run callbacks). The pre-run in-memory ``Project`` is stale after a run mutates
+        ``project.json``, so rebuilding from disk is mandatory before re-attaching the panels.
+        """
+        assert self._store is not None
+        self._service = ReviewService(self._store, self._store.load())
+
     def _notify_project_loaded(self) -> None:
-        """Hand the current store to the review panel (if the app wired the hook)."""
-        if self.on_project_loaded is not None and self._store is not None:
-            self.on_project_loaded(self._store)
+        """Hand the shared service to the review panels (if the app wired the hook)."""
+        if self.on_project_loaded is not None and self._service is not None:
+            self.on_project_loaded(self._service)
 
     def _refresh_status(self) -> None:
-        """Re-read the project and push its stage rows + next-stage + review/voice availability."""
+        """Re-read the project and push its stage rows + next-stage + review/voice/text avail."""
         assert self._store is not None
         project = self._store.load()
         self._view.show_stage_rows(stage_status_rows(project, self._pipeline))
@@ -328,3 +366,5 @@ class ProjectPresenter:
         has_segments = _has_segments(project)
         self._view.set_review_available(has_segments)
         self._view.set_voice_available(has_segments)
+        # Text review opens earlier — as soon as the correct stage lands suggestions.
+        self._view.set_text_available(_has_suggestions(project))

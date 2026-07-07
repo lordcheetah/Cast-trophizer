@@ -17,7 +17,31 @@ from casttrophizer.domain.enums import ReviewStatus, SpeakerRole
 from casttrophizer.domain.ids import new_id
 from casttrophizer.domain.models import Line, Project, Segment, Speaker, TextSuggestion
 from casttrophizer.review import actions
+from casttrophizer.review.gate import review_blockers
 from casttrophizer.workspace.audio_cache import AudioCache
+
+
+def _pending_suggestion(original: str, suggested: str) -> TextSuggestion:
+    return TextSuggestion(
+        id=new_id("sug"),
+        original=original,
+        suggested=suggested,
+        reason="spellcheck",
+        confidence=0.7,
+        status=ReviewStatus.PENDING,
+    )
+
+
+def _seg(text: str) -> Segment:
+    """A minimal APPROVED narrator segment carrying ``text`` (for propagation tests)."""
+    return Segment(
+        id=new_id("seg"),
+        text=text,
+        speaker_id=None,
+        role=SpeakerRole.NARRATOR,
+        confidence=1.0,
+        review_status=ReviewStatus.APPROVED,
+    )
 
 
 def _first_line(project: Project) -> Line:
@@ -107,13 +131,114 @@ def test_suggestion_action_raises_on_unknown_id(review_ready_project: Project) -
         actions.accept_suggestion(line, "sug_missing")
 
 
-def test_edit_line_text_leaves_segments_untouched(review_ready_project: Project) -> None:
-    line = _first_line(review_ready_project)
-    before = [(s.id, s.text, s.speaker_id) for s in line.segments]
-    actions.edit_line_text(line, "A brand new sentence.")
-    assert line.text == "A brand new sentence."
-    after = [(s.id, s.text, s.speaker_id) for s in line.segments]
-    assert before == after  # segments NOT re-derived (deferred propagation)
+def test_accept_suggestion_propagates_to_matching_segment_and_forces_rerender(
+    review_ready_project: Project,
+) -> None:
+    """Accepting fixes the spoken segment too: text changes, cache reset, key differs."""
+    project = review_ready_project
+    seg = _seg("The narrarator spoke.")  # speaker_id=None -> resolves to the narrator
+    line = Line(
+        id=new_id("ln"),
+        chapter_id="c",
+        order=9,
+        text="The narrarator spoke.",
+        segments=[seg],
+        suggestions=[_pending_suggestion("narrarator", "narrator")],
+    )
+    key_before = AudioCache.key_for(seg, project)
+    seg.audio_cache_key = key_before  # simulate an already-rendered segment
+    seg.audio_status = ReviewStatus.COMPLETED
+
+    actions.accept_suggestion(line, line.suggestions[0].id)
+
+    assert line.text == "The narrator spoke."
+    assert seg.text == "The narrator spoke."  # propagated to the segment
+    assert seg.audio_cache_key is None  # stale key nulled
+    assert seg.audio_status == ReviewStatus.PENDING
+    assert AudioCache.key_for(seg, project) != key_before  # recomputed key differs -> re-render
+
+
+def test_accept_suggestion_double_occurrence_first_segment_first_occurrence() -> None:
+    """Multiple matches: only the first containing segment, and only its first occurrence."""
+    seg_a = _seg("foo foo")
+    seg_b = _seg("and foo")
+    line = Line(
+        id=new_id("ln"),
+        chapter_id="c",
+        order=1,
+        text="foo foo and foo",
+        segments=[seg_a, seg_b],
+        suggestions=[_pending_suggestion("foo", "bar")],
+    )
+    actions.accept_suggestion(line, line.suggestions[0].id)
+    assert line.text == "bar foo and foo"  # line-level: first occurrence only
+    assert seg_a.text == "bar foo"  # first containing segment, first occurrence only
+    assert seg_b.text == "and foo"  # later segment untouched
+
+
+def test_accept_suggestion_token_in_no_segment_leaves_segments_untouched() -> None:
+    """Token absent from every segment: ``line.text`` still fixed, segments untouched."""
+    seg = _seg("an unrelated span")
+    seg.audio_cache_key = "STALE"
+    seg.audio_status = ReviewStatus.COMPLETED
+    line = Line(
+        id=new_id("ln"),
+        chapter_id="c",
+        order=1,
+        text="The narrarator spoke.",
+        segments=[seg],
+        suggestions=[_pending_suggestion("narrarator", "narrator")],
+    )
+    actions.accept_suggestion(line, line.suggestions[0].id)
+    assert line.text == "The narrator spoke."  # line-level fix still stands
+    assert seg.text == "an unrelated span"  # untouched
+    assert seg.audio_cache_key == "STALE"  # not reset (nothing to re-render)
+    assert seg.audio_status == ReviewStatus.COMPLETED
+
+
+def test_edit_line_text_resegments_and_reopens_attribution(review_ready_project: Project) -> None:
+    """A whole-line rewrite re-segments: a new quote returns to NEEDS_REVIEW (re-opens crit 1)."""
+    project = review_ready_project
+    line = _first_line(project)  # line0: two APPROVED segments, no NEEDS_REVIEW
+    before = len(review_blockers(project).needs_attribution)
+
+    resegmented = actions.edit_line_text(line, 'Narration. "New quote," said Zed.', project)
+
+    assert resegmented is True
+    assert line.text == 'Narration. "New quote," said Zed.'
+    quote = next(s for s in line.segments if s.review_status == ReviewStatus.NEEDS_REVIEW)
+    assert quote.speaker_id is None  # narrator-fallback until manually re-attributed
+    assert quote.audio_cache_key is None  # fresh segment -> re-renders
+    assert len(review_blockers(project).needs_attribution) > before  # attribution re-opened
+
+
+def test_edit_line_text_narration_only_does_not_reopen_attribution(
+    review_ready_project: Project,
+) -> None:
+    project = review_ready_project
+    line = _first_line(project)
+    narrator = next(sp for sp in project.speakers if sp.role == SpeakerRole.NARRATOR)
+    before = len(review_blockers(project).needs_attribution)
+
+    resegmented = actions.edit_line_text(line, "Just plain narration now.", project)
+
+    assert resegmented is True
+    assert len(line.segments) == 1
+    assert line.segments[0].review_status == ReviewStatus.APPROVED
+    assert line.segments[0].speaker_id == narrator.id
+    assert len(review_blockers(project).needs_attribution) == before  # no new blocker
+
+
+def test_edit_line_text_inert_edit_keeps_segments(review_ready_project: Project) -> None:
+    """A no-op (whitespace-only) edit returns False and leaves the segments in place."""
+    project = review_ready_project
+    line = _first_line(project)
+    seg_ids_before = [s.id for s in line.segments]
+
+    resegmented = actions.edit_line_text(line, line.text, project)  # identical text
+
+    assert resegmented is False
+    assert [s.id for s in line.segments] == seg_ids_before  # same objects, not rebuilt
 
 
 # --------------------------------------------------------------------------- #

@@ -17,6 +17,7 @@ import pytest
 
 from casttrophizer.config import AppConfig
 from casttrophizer.domain.models import Project
+from casttrophizer.review.service import ReviewService
 from casttrophizer.ui import voice_panel as voice_panel_module
 from casttrophizer.ui.main_window import MainWindow
 from casttrophizer.ui.voice_panel import VoicePanel
@@ -90,7 +91,7 @@ def _wire(store: WorkspaceStore) -> tuple[VoicePanel, VoicePresenter, list[int]]
     presenter = VoicePresenter(
         view=panel, config=AppConfig(), on_reviewed=lambda: reviewed.append(1)
     )
-    presenter.attach(store)
+    presenter.attach(ReviewService(store, store.load()))
     panel.filter_changed = presenter.set_filter
     panel.assign_requested = presenter.assign
     panel.unassign_requested = presenter.unassign

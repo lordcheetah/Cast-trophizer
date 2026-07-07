@@ -39,6 +39,7 @@ class FakeProjectView:
         self.next_stage: object = "UNSET"
         self.review_available: list[bool] = []
         self.voice_available: list[bool] = []
+        self.text_available: list[bool] = []
         self.running: list[bool] = []
         self.progress: list[tuple[int, int, str]] = []
         self.outcomes: list[object] = []
@@ -58,6 +59,9 @@ class FakeProjectView:
 
     def set_voice_available(self, available: bool) -> None:
         self.voice_available.append(available)
+
+    def set_text_available(self, available: bool) -> None:
+        self.text_available.append(available)
 
     def set_running(self, running: bool) -> None:
         self.running.append(running)
@@ -371,17 +375,52 @@ def _flagged_segment(project: Project) -> Segment:
     )
 
 
-def test_open_fires_on_project_loaded_hook(
+def test_open_fires_on_project_loaded_hook_with_the_shared_service(
     tmp_workspace: WorkspaceStore, review_ready_project: Project, tmp_path: Path
 ) -> None:
     view = FakeProjectView()
     presenter = _presenter(view, FakeRunExecutor(), _deps(tmp_path))
-    handed: list[WorkspaceStore] = []
+    handed: list[ReviewService] = []
     presenter.on_project_loaded = handed.append
 
     presenter.open(tmp_workspace.layout.root)
 
-    assert handed == [presenter._store]  # the loaded store is handed to the review panel
+    # The one shared ReviewService is handed to the review panels (not a bare store).
+    assert handed == [presenter.service]
+    assert isinstance(presenter.service, ReviewService)
+
+
+def test_service_is_rebuilt_after_each_terminal_path(
+    tmp_workspace: WorkspaceStore, review_ready_project: Project, tmp_path: Path
+) -> None:
+    """``_adopt`` / ``_on_finished`` / ``_on_failed`` each rebuild the shared service + notify.
+
+    A stale service on any terminal path would let a later edit clobber what the run persisted;
+    this pins that every terminal path hands the panels a fresh :class:`ReviewService`.
+    """
+    view = FakeProjectView()
+    result = StageResult(stage=StageName.REVIEW, status=ReviewStatus.NEEDS_REVIEW)
+    presenter = _presenter(view, FakeRunExecutor(result=result), _deps(tmp_path))
+    handed: list[ReviewService] = []
+    presenter.on_project_loaded = handed.append
+
+    presenter.open(tmp_workspace.layout.root)  # _adopt
+    after_open = presenter.service
+    assert isinstance(after_open, ReviewService)
+
+    presenter.start_run()  # _on_finished
+    after_finish = presenter.service
+    assert isinstance(after_finish, ReviewService)
+    assert after_finish is not after_open  # rebuilt from disk, not the pre-run object
+
+    # A failed worker signal also rebuilds + re-notifies (the latent staleness fix).
+    presenter._on_failed("boom")
+    after_fail = presenter.service
+    assert isinstance(after_fail, ReviewService)
+    assert after_fail is not after_finish
+
+    # Every terminal path fired the hook with the then-current shared service.
+    assert handed == [after_open, after_finish, after_fail]
 
 
 def test_review_available_true_with_segments_false_without(
@@ -417,16 +456,17 @@ def test_refresh_after_review_rerenders_needs_review_summary_from_disk(
     presenter.start_run()  # sets _last_outcome_kind = NEEDS_REVIEW (one flagged segment on disk)
     assert view.outcomes[-1].blockers.needs_attribution  # the pre-edit summary has the blocker
 
-    # Simulate the AttributionPresenter's edit: approve the flagged segment through ReviewService.
-    edited = tmp_workspace.load()
-    service = ReviewService(tmp_workspace, edited)
-    service.approve_attribution(_flagged_segment(edited))
+    # Simulate the AttributionPresenter's edit through the SHARED service the presenter owns —
+    # exactly the object the panels mutate (they attach to ``presenter.service`` by reference).
+    service = presenter.service
+    assert service is not None
+    service.approve_attribution(_flagged_segment(service.project))
 
     presenter.refresh_after_review()  # the on_reviewed callback the app wires
 
     latest = view.outcomes[-1]
     assert latest.kind == RunOutcomeKind.NEEDS_REVIEW  # still blocked by the suggestion/voice
-    assert latest.blockers.needs_attribution == []  # attribution count decremented, from disk
+    assert latest.blockers.needs_attribution == []  # attribution count decremented, live
 
 
 def test_structural_protocol_conformance() -> None:

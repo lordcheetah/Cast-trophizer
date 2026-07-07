@@ -12,6 +12,7 @@ import pytest
 
 from casttrophizer.domain.enums import ReviewStatus
 from casttrophizer.domain.models import Project
+from casttrophizer.review.service import ReviewService
 from casttrophizer.ui.attribution_panel import AttributionPanel
 from casttrophizer.ui.attribution_presenter import AttributionPresenter, AttributionView
 from casttrophizer.ui.main_window import MainWindow
@@ -25,7 +26,7 @@ def _wire(store: WorkspaceStore) -> tuple[AttributionPanel, AttributionPresenter
     panel = AttributionPanel()
     reviewed: list[int] = []
     presenter = AttributionPresenter(view=panel, on_reviewed=lambda: reviewed.append(1))
-    presenter.attach(store)
+    presenter.attach(ReviewService(store, store.load()))
     panel.filter_changed = presenter.set_filter
     panel.approve_requested = presenter.approve
     panel.reassign_existing_requested = presenter.reassign_existing
