@@ -341,3 +341,98 @@ def test_full_resolution_via_service_makes_gate_complete(
 
     reloaded = _reload(project)
     assert is_review_complete(reloaded) is True
+
+
+# --------------------------------------------------------------------------- #
+# per-segment audio review (post-synthesize): approve / reroll / commit
+# --------------------------------------------------------------------------- #
+def _completed_segment(project: Project) -> Segment:
+    seg = next(
+        seg
+        for ch in project.book.chapters
+        for ln in ch.lines
+        for seg in ln.segments
+        if seg.text.strip()
+    )
+    seg.audio_status = ReviewStatus.COMPLETED
+    seg.audio_cache_key = "old-key"
+    return seg
+
+
+def test_approve_audio_flips_to_approved_without_reopening_review(
+    tmp_workspace: WorkspaceStore, review_ready_project: Project
+) -> None:
+    project = review_ready_project
+    project.stage_status[str(StageName.REVIEW)] = ReviewStatus.COMPLETED
+    seg = _completed_segment(project)
+    tmp_workspace.save(project)
+    service = ReviewService(tmp_workspace, project)
+
+    service.approve_audio(seg)
+
+    assert seg.audio_status == ReviewStatus.APPROVED
+    reloaded = _reload(project)
+    # Approval is a curation marker: it must NOT re-open the pre-synth review gate.
+    assert str(StageName.REVIEW) in reloaded.stage_status
+
+
+def test_reroll_audio_sets_new_seed_resets_key_and_reopens_render(
+    tmp_workspace: WorkspaceStore, review_ready_project: Project
+) -> None:
+    project = review_ready_project
+    project.stage_status[str(StageName.REVIEW)] = ReviewStatus.COMPLETED
+    project.stage_status[str(StageName.SYNTHESIZE)] = ReviewStatus.COMPLETED
+    project.stage_status[str(StageName.ASSEMBLE)] = ReviewStatus.COMPLETED
+    seg = _completed_segment(project)
+    tmp_workspace.save(project)
+    service = ReviewService(tmp_workspace, project)
+
+    service.reroll_audio(seg)
+
+    assert seg.audio_seed is not None  # a fresh seed was drawn
+    assert seg.audio_cache_key is None
+    assert seg.audio_status == ReviewStatus.PENDING
+    reloaded = _reload(project)
+    # Render stages re-opened so the fresh take (re-)synthesizes and the M4B rebuilds...
+    assert str(StageName.SYNTHESIZE) not in reloaded.stage_status
+    assert str(StageName.ASSEMBLE) not in reloaded.stage_status
+    # ...but the pre-synth review gate is untouched (audio review is post-synth).
+    assert str(StageName.REVIEW) in reloaded.stage_status
+
+
+def test_reroll_audio_draws_a_different_seed_each_time(
+    tmp_workspace: WorkspaceStore, review_ready_project: Project
+) -> None:
+    project = review_ready_project
+    seg = _completed_segment(project)
+    tmp_workspace.save(project)
+    service = ReviewService(tmp_workspace, project)
+
+    service.reroll_audio(seg)
+    first = seg.audio_seed
+    service.reroll_audio(seg)
+    second = seg.audio_seed
+
+    assert first is not None and second is not None
+    assert first != second  # a re-roll always changes the seed (hence the take)
+
+
+def test_commit_rendered_audio_persists_current_state(
+    tmp_workspace: WorkspaceStore, review_ready_project: Project
+) -> None:
+    project = review_ready_project
+    seg = _completed_segment(project)
+    tmp_workspace.save(project)
+    service = ReviewService(tmp_workspace, project)
+
+    # Simulate the worker having stamped the segment in memory, then commit.
+    seg.audio_status = ReviewStatus.COMPLETED
+    seg.audio_cache_key = "fresh-key"
+    service.commit_rendered_audio(seg)
+
+    reloaded = _reload(project)
+    committed = next(
+        s for ch in reloaded.book.chapters for ln in ch.lines for s in ln.segments if s.id == seg.id
+    )
+    assert committed.audio_cache_key == "fresh-key"
+    assert committed.audio_status == ReviewStatus.COMPLETED

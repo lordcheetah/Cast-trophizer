@@ -37,6 +37,7 @@ from PySide6.QtWidgets import (
 from casttrophizer.app_service import RunOutcome, RunOutcomeKind, StageRow
 from casttrophizer.domain.enums import StageName
 from casttrophizer.ui.attribution_panel import AttributionPanel
+from casttrophizer.ui.audio_panel import AudioPanel
 from casttrophizer.ui.suggestion_panel import SuggestionPanel
 from casttrophizer.ui.voice_panel import VoicePanel
 
@@ -63,13 +64,15 @@ class MainWindow(QMainWindow):
         self.review_text_requested: Callable[[], None] = _noop
         self.review_attributions_requested: Callable[[], None] = _noop
         self.assign_voices_requested: Callable[[], None] = _noop
+        self.review_audio_requested: Callable[[], None] = _noop
 
         self._build_ui()
 
     # -- construction ------------------------------------------------------- #
     def _build_ui(self) -> None:
-        # A four-page stack: the slice-1 shell (page 0), the attribution panel (page 1), the
-        # voice-assignment panel (page 2), and the text-suggestion panel (page 3).
+        # A five-page stack: the slice-1 shell (page 0), the attribution panel (page 1), the
+        # voice-assignment panel (page 2), the text-suggestion panel (page 3), and the
+        # per-segment audio-review panel (page 4).
         self._stack = QStackedWidget()
         self._stack.addWidget(self._build_shell_page())
         self.attribution_panel = AttributionPanel()
@@ -78,6 +81,8 @@ class MainWindow(QMainWindow):
         self._stack.addWidget(self.voice_panel)
         self.suggestion_panel = SuggestionPanel()
         self._stack.addWidget(self.suggestion_panel)
+        self.audio_panel = AudioPanel()
+        self._stack.addWidget(self.audio_panel)
         self.setCentralWidget(self._stack)
 
     def _build_shell_page(self) -> QWidget:
@@ -143,6 +148,10 @@ class MainWindow(QMainWindow):
         self._voice_btn.setEnabled(False)  # enabled once the project has referenced speakers
         self._voice_btn.clicked.connect(lambda: self.assign_voices_requested())
         review_row.addWidget(self._voice_btn)
+        self._audio_btn = QPushButton("Review audio")
+        self._audio_btn.setEnabled(False)  # enabled once a segment is rendered
+        self._audio_btn.clicked.connect(lambda: self.review_audio_requested())
+        review_row.addWidget(self._audio_btn)
         review_row.addStretch(1)
         root.addLayout(review_row)
 
@@ -164,6 +173,10 @@ class MainWindow(QMainWindow):
     def show_text_page(self) -> None:
         """Switch the stack to the embedded text-suggestion panel (page 3)."""
         self._stack.setCurrentIndex(3)
+
+    def show_audio_page(self) -> None:
+        """Switch the stack to the embedded per-segment audio-review panel (page 4)."""
+        self._stack.setCurrentIndex(4)
 
     # -- intent handlers (open file dialogs, then delegate) ----------------- #
     def _on_open_clicked(self) -> None:
@@ -202,6 +215,9 @@ class MainWindow(QMainWindow):
     def set_voice_available(self, available: bool) -> None:
         self._voice_btn.setEnabled(available)
 
+    def set_audio_available(self, available: bool) -> None:
+        self._audio_btn.setEnabled(available)
+
     def set_running(self, running: bool) -> None:
         self._run_btn.setEnabled(not running)
         self._stop_btn.setEnabled(running)
@@ -215,6 +231,7 @@ class MainWindow(QMainWindow):
             self._text_btn.setEnabled(False)
             self._review_btn.setEnabled(False)
             self._voice_btn.setEnabled(False)
+            self._audio_btn.setEnabled(False)
 
     def set_progress(self, done: int, total: int, message: str) -> None:
         if total > 0:

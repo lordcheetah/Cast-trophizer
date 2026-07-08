@@ -13,6 +13,7 @@ This module imports no Qt and no concrete provider SDK, so importing it is cheap
 
 from __future__ import annotations
 
+import importlib.util
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -28,7 +29,27 @@ from casttrophizer.providers import (
 if TYPE_CHECKING:
     from casttrophizer.audio.assembler import M4BAssembler
 
-__all__ = ["AppServiceDeps", "default_llm_factory", "default_tts_factory"]
+__all__ = [
+    "AppServiceDeps",
+    "default_llm_factory",
+    "default_tts_factory",
+    "tts_extra_available",
+]
+
+
+def tts_extra_available() -> bool:
+    """True iff the ``tts`` extra (Chatterbox) is importable — a cheap graceful-degradation probe.
+
+    Uses :func:`importlib.util.find_spec` so it never actually imports Chatterbox/torch (the heavy
+    model is loaded lazily inside the provider on the first ``synthesize``). The audio-review UI
+    calls this to decide whether the in-session **regenerate-now** render is possible: when the
+    extra is absent (CI, or a user without torch) regenerate is disabled while play/approve stay
+    available. A ``find_spec`` that raises (a broken partial install) is treated as unavailable.
+    """
+    try:
+        return importlib.util.find_spec("chatterbox") is not None
+    except (ImportError, ValueError):
+        return False
 
 
 def default_llm_factory(config: AppConfig) -> LLMProvider:

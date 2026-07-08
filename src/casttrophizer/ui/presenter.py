@@ -35,6 +35,7 @@ from casttrophizer.app_service import (
     stage_status_rows,
 )
 from casttrophizer.app_service.status import StageRow
+from casttrophizer.audio.synthesize import RENDERED_STATUSES
 from casttrophizer.config import AppConfig
 from casttrophizer.domain.enums import StageName
 from casttrophizer.domain.models import Project
@@ -44,6 +45,7 @@ from casttrophizer.pipeline.stage import StageResult
 from casttrophizer.providers import LLMProvider, TTSProvider
 from casttrophizer.review.gate import describe_blockers, review_blockers
 from casttrophizer.review.service import ReviewService
+from casttrophizer.workspace.audio_cache import AudioCache
 from casttrophizer.workspace.store import WorkspaceStore
 
 __all__ = ["ProjectView", "RunExecutor", "ProjectPresenter"]
@@ -52,6 +54,21 @@ __all__ = ["ProjectView", "RunExecutor", "ProjectPresenter"]
 def _has_segments(project: Project) -> bool:
     """True iff any line carries at least one segment (attribution has produced review work)."""
     return any(ln.segments for ch in project.book.chapters for ln in ch.lines)
+
+
+def _has_rendered_audio(project: Project) -> bool:
+    """True iff any segment is in :data:`RENDERED_STATUSES` (synthesize produced a reviewable take).
+
+    Gates the 'Review audio' entry point: audio review only opens once at least one segment has
+    been synthesized (COMPLETED or already-APPROVED). A FAILED-only project has nothing to audition
+    yet, so it stays closed until a re-run renders something.
+    """
+    return any(
+        seg.audio_status in RENDERED_STATUSES
+        for ch in project.book.chapters
+        for ln in ch.lines
+        for seg in ln.segments
+    )
 
 
 def _has_suggestions(project: Project) -> bool:
@@ -95,6 +112,10 @@ class ProjectView(Protocol):
 
     def set_text_available(self, available: bool) -> None:
         """Enable/disable the 'Review text' entry point (true once suggestions exist)."""
+        ...
+
+    def set_audio_available(self, available: bool) -> None:
+        """Enable/disable the 'Review audio' entry point (true once a segment is rendered)."""
         ...
 
     def set_running(self, running: bool) -> None:
@@ -188,6 +209,16 @@ class ProjectPresenter:
         rebuilt from disk at the two authoritative points (project load, run finish).
         """
         return self._service
+
+    @property
+    def audio_cache(self) -> AudioCache | None:
+        """The workspace :class:`AudioCache`, or ``None`` before a project is opened/created.
+
+        Built from ``store.layout`` (the store exposes it), so the audio-review panel can resolve
+        per-segment WAV paths + existence for audition and the regenerate render target. ``None``
+        until a store is adopted; ``ui/app.py`` re-passes it on every project load / run finish.
+        """
+        return AudioCache(self._store.layout) if self._store is not None else None
 
     # -- intents ------------------------------------------------------------ #
     def open(self, workspace_dir: str | Path) -> None:
@@ -368,3 +399,5 @@ class ProjectPresenter:
         self._view.set_voice_available(has_segments)
         # Text review opens earlier — as soon as the correct stage lands suggestions.
         self._view.set_text_available(_has_suggestions(project))
+        # Audio review opens later — only once synthesize has produced a reviewable take.
+        self._view.set_audio_available(_has_rendered_audio(project))

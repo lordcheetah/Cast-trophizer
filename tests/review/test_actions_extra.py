@@ -77,3 +77,34 @@ def test_create_character_does_not_touch_segments(review_ready_project: Project)
         (s.id, s.speaker_id) for ch in project.book.chapters for ln in ch.lines for s in ln.segments
     ]
     assert segs_before == segs_after
+
+
+# --------------------------------------------------------------------------- #
+# per-segment audio review actions (pure)
+# --------------------------------------------------------------------------- #
+def _audio_segment(status: ReviewStatus) -> Segment:
+    return Segment(
+        id="seg-1",
+        text="hi",
+        speaker_id=None,
+        role=SpeakerRole.NARRATOR,
+        confidence=1.0,
+        review_status=ReviewStatus.APPROVED,
+        audio_cache_key="k",
+        audio_status=status,
+    )
+
+
+def test_approve_audio_sets_approved() -> None:
+    seg = _audio_segment(ReviewStatus.COMPLETED)
+    actions.approve_audio(seg)
+    assert seg.audio_status == ReviewStatus.APPROVED
+    assert seg.audio_cache_key == "k"  # approval never touches the render/key
+
+
+def test_reroll_audio_sets_seed_clears_key_and_pends() -> None:
+    seg = _audio_segment(ReviewStatus.COMPLETED)
+    actions.reroll_audio(seg, seed=4242)
+    assert seg.audio_seed == 4242
+    assert seg.audio_cache_key is None
+    assert seg.audio_status == ReviewStatus.PENDING

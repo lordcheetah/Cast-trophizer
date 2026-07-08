@@ -107,19 +107,81 @@ def test_voice_category_round_trips(sample_project: Project) -> None:
 
 def test_v1_to_v2_migration_defaults_speakers_to_unknown(sample_project: Project) -> None:
     # A hand-built v1 dict (schema_version=1, no per-speaker `category` key) must migrate:
-    # every speaker defaults to `unknown` and the loaded project re-serializes at v2.
+    # every speaker defaults to `unknown` and the loaded project re-serializes at the current
+    # version (the v1->v2 category default is what this test isolates).
     data = project_to_dict(sample_project)
     data["schema_version"] = 1
     for speaker in data["speakers"]:
         del speaker["category"]
 
     restored = project_from_dict(data)
-    assert restored.schema_version == CURRENT_SCHEMA_VERSION == 2
+    assert restored.schema_version == CURRENT_SCHEMA_VERSION == 3
     assert all(sp.category == VoiceCategory.UNKNOWN for sp in restored.speakers)
-    # Re-serializing stamps v2 and writes the category key back.
+    # Re-serializing stamps the current version and writes the category key back.
     reserialized = project_to_dict(restored)
-    assert reserialized["schema_version"] == 2
+    assert reserialized["schema_version"] == 3
     assert all(sp["category"] == "unknown" for sp in reserialized["speakers"])
+
+
+def test_segment_audio_seed_round_trips(sample_project: Project) -> None:
+    # The per-segment re-roll seed (schema v3) round-trips losslessly.
+    seg = sample_project.book.chapters[0].lines[0].segments[0]
+    seg.audio_seed = 123456
+    restored = project_from_dict(project_to_dict(sample_project))
+    assert restored.book.chapters[0].lines[0].segments[0].audio_seed == 123456
+    assert restored == sample_project
+
+
+def test_v2_to_v3_migration_defaults_segments_audio_seed_to_none(sample_project: Project) -> None:
+    # A hand-built v2 dict (schema_version=2, no per-segment `audio_seed` key) must migrate: every
+    # segment gains `audio_seed=None` and the loaded project re-serializes at v3. Mirrors the
+    # v1->v2 test; `None` is deliberately NOT folded into the cache key, so no WAV invalidation.
+    data = project_to_dict(sample_project)
+    data["schema_version"] = 2
+    for chapter in data["book"]["chapters"]:
+        for line in chapter["lines"]:
+            for segment in line["segments"]:
+                del segment["audio_seed"]
+
+    restored = project_from_dict(data)
+    assert restored.schema_version == CURRENT_SCHEMA_VERSION == 3
+    assert all(
+        seg.audio_seed is None
+        for ch in restored.book.chapters
+        for ln in ch.lines
+        for seg in ln.segments
+    )
+    reserialized = project_to_dict(restored)
+    assert reserialized["schema_version"] == 3
+    assert all(
+        seg["audio_seed"] is None
+        for ch in reserialized["book"]["chapters"]
+        for ln in ch["lines"]
+        for seg in ln["segments"]
+    )
+
+
+def test_v1_dict_migrates_all_the_way_to_v3(sample_project: Project) -> None:
+    # A v1 dict (no `category`, no `audio_seed`) must chain v1->v2->v3 in one load: speakers default
+    # to `unknown` AND segments default `audio_seed=None`.
+    data = project_to_dict(sample_project)
+    data["schema_version"] = 1
+    for speaker in data["speakers"]:
+        del speaker["category"]
+    for chapter in data["book"]["chapters"]:
+        for line in chapter["lines"]:
+            for segment in line["segments"]:
+                del segment["audio_seed"]
+
+    restored = project_from_dict(data)
+    assert restored.schema_version == 3
+    assert all(sp.category == VoiceCategory.UNKNOWN for sp in restored.speakers)
+    assert all(
+        seg.audio_seed is None
+        for ch in restored.book.chapters
+        for ln in ch.lines
+        for seg in ln.segments
+    )
 
 
 def test_voice_category_coerce_maps_unknown_strings() -> None:
@@ -193,11 +255,11 @@ def test_v1_project_on_disk_migrates_through_the_workspace_store(
     store.layout.project_file.write_text(json.dumps(v1, indent=2), encoding="utf-8")
 
     loaded = store.load()  # the exact path the CLI uses
-    assert loaded.schema_version == CURRENT_SCHEMA_VERSION == 2
+    assert loaded.schema_version == CURRENT_SCHEMA_VERSION == 3
     assert all(sp.category == VoiceCategory.UNKNOWN for sp in loaded.speakers)
 
-    # Re-save and confirm the file is now a clean v2 with category keys present.
+    # Re-save and confirm the file is now a clean current-version file with category keys present.
     store.save(loaded)
     reread = json.loads(store.layout.project_file.read_text(encoding="utf-8"))
-    assert reread["schema_version"] == 2
+    assert reread["schema_version"] == 3
     assert all(sp["category"] == "unknown" for sp in reread["speakers"])

@@ -16,6 +16,7 @@ from casttrophizer.app_service.deps import (
     AppServiceDeps,
     default_llm_factory,
     default_tts_factory,
+    tts_extra_available,
 )
 from casttrophizer.app_service.outcome import (
     RunOutcome,
@@ -43,6 +44,7 @@ __all__ = [
     "AppServiceDeps",
     "default_llm_factory",
     "default_tts_factory",
+    "tts_extra_available",
     "RunOutcome",
     "RunOutcomeKind",
     "interpret_result",

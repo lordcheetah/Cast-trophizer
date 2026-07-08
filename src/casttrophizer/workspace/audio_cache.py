@@ -45,12 +45,19 @@ class AudioCache:
         segment_text: str,
         voice_clip_id: str | None,
         tts_params: Mapping[str, Any],
+        audio_seed: int | None = None,
     ) -> str:
         """Compute the deterministic cache key for a segment's audio.
 
         ``voice_clip_id`` may be ``None`` (a speaker with no assigned voice, or a None
         segment with no narrator to resolve to); it is folded into the hash as an empty
         string so the key is still stable.
+
+        ``audio_seed`` (the per-segment re-roll seed) is folded in **only when non-None**: a
+        ``None`` seed appends nothing, so every existing (pre-schema-v3) segment's key stays
+        **byte-identical** to today's — upgrading a v2 project does not invalidate its cache.
+        A re-rolled (non-None) seed appends ``\\x00seed\\x00<seed>``, so exactly that segment
+        gets a new key and re-renders.
         """
         h = hashlib.sha256()
         h.update(segment_text.encode("utf-8"))
@@ -58,6 +65,9 @@ class AudioCache:
         h.update((voice_clip_id or "").encode("utf-8"))
         h.update(b"\x00")
         h.update(_canonical_params(tts_params).encode("utf-8"))
+        if audio_seed is not None:
+            h.update(b"\x00seed\x00")
+            h.update(str(audio_seed).encode("utf-8"))
         return h.hexdigest()
 
     @classmethod
@@ -72,7 +82,7 @@ class AudioCache:
         stays deterministic and will change once a voice is assigned.
         """
         voice_clip_id = cls._voice_clip_id_for(segment, project)
-        return cls.compute_key(segment.text, voice_clip_id, project.tts_params)
+        return cls.compute_key(segment.text, voice_clip_id, project.tts_params, segment.audio_seed)
 
     @staticmethod
     def _voice_clip_id_for(segment: Segment, project: Project) -> str | None:

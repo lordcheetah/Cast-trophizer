@@ -37,7 +37,11 @@ __all__ = ["CURRENT_SCHEMA_VERSION", "project_to_dict", "project_from_dict"]
 #: History:
 #:   v1 -> v2: added ``Speaker.category`` (:class:`VoiceCategory`); pre-v2 speakers with no
 #:             ``category`` key default to ``unknown`` (see :func:`_migrate_v1_to_v2`).
-CURRENT_SCHEMA_VERSION = 2
+#:   v2 -> v3: added ``Segment.audio_seed`` (per-segment render seed, re-rolled on an audio-review
+#:             regenerate); pre-v3 segments default it to ``None`` (see :func:`_migrate_v2_to_v3`).
+#:             ``None`` is NOT folded into the AudioCache key, so upgrading a v2 project keeps every
+#:             cached WAV valid (no wholesale invalidation).
+CURRENT_SCHEMA_VERSION = 3
 
 
 # --------------------------------------------------------------------------- #
@@ -64,6 +68,7 @@ def _segment_to_dict(seg: Segment) -> dict[str, Any]:
         "review_status": str(seg.review_status),
         "audio_cache_key": seg.audio_cache_key,
         "audio_status": str(seg.audio_status),
+        "audio_seed": seg.audio_seed,
     }
 
 
@@ -150,6 +155,9 @@ def _segment_from_dict(d: dict[str, Any]) -> Segment:
         review_status=ReviewStatus(d["review_status"]),
         audio_cache_key=d["audio_cache_key"],
         audio_status=ReviewStatus(d["audio_status"]),
+        # ``.get`` so a pre-migration (v2) dict — or a re-serialize before ``_migrate`` ran —
+        # is safe; ``_migrate_v2_to_v3`` sets the key explicitly for a fully-migrated dict.
+        audio_seed=d.get("audio_seed"),
     )
 
 
@@ -249,7 +257,9 @@ def _migrate(data: dict[str, Any], version: int) -> dict[str, Any]:
     if version == 1:
         data = _migrate_v1_to_v2(data)
         version = 2
-    # future: if version == 2: data = _migrate_v2_to_v3(data); version = 3
+    if version == 2:
+        data = _migrate_v2_to_v3(data)
+        version = 3
     if version != CURRENT_SCHEMA_VERSION:
         raise MigrationError(
             f"no migration path from schema_version {version} to {CURRENT_SCHEMA_VERSION}"
@@ -265,4 +275,19 @@ def _migrate_v1_to_v2(data: dict[str, Any]) -> dict[str, Any]:
     """
     for speaker in data.get("speakers", []):
         speaker.setdefault("category", str(VoiceCategory.UNKNOWN))
+    return data
+
+
+def _migrate_v2_to_v3(data: dict[str, Any]) -> dict[str, Any]:
+    """v2 -> v3: stamp every segment with ``audio_seed=None`` (the field's new default).
+
+    Pre-feature segments had no ``audio_seed`` key. ``None`` means "use the global seed" and is
+    NOT folded into the :class:`~casttrophizer.workspace.audio_cache.AudioCache` key, so a migrated
+    v2 project keeps every cached WAV valid — no wholesale re-render. ``setdefault`` mirrors
+    :func:`_migrate_v1_to_v2`, so a dict that (unexpectedly) already carries a seed is preserved.
+    """
+    for chapter in data.get("book", {}).get("chapters", []):
+        for line in chapter.get("lines", []):
+            for segment in line.get("segments", []):
+                segment.setdefault("audio_seed", None)
     return data

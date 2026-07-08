@@ -56,6 +56,9 @@ __all__ = [
     "assign_voice_by_ids",
     "unassign_voice",
     "set_speaker_category",
+    "approve_audio",
+    "reroll_audio",
+    "fail_audio",
 ]
 
 
@@ -295,3 +298,44 @@ def set_speaker_category(speaker: Speaker, category: VoiceCategory) -> None:
     forces no re-render.
     """
     speaker.category = category
+
+
+# --------------------------------------------------------------------------- #
+# per-segment audio review (§B.5)
+# --------------------------------------------------------------------------- #
+def approve_audio(segment: Segment) -> None:
+    """Approve a segment's rendered take: ``audio_status`` COMPLETED -> APPROVED.
+
+    A pure curation marker: both COMPLETED and APPROVED are ``RENDERED_STATUSES`` (the synth
+    skip-gate treats them identically and assemble stitches both), so approval changes nothing
+    about the render — it just records the user's sign-off so the panel can show "N of M
+    approved" and filter the un-approved. Idempotent for an already-APPROVED segment.
+    """
+    segment.audio_status = ReviewStatus.APPROVED
+
+
+def reroll_audio(segment: Segment, *, seed: int) -> None:
+    """Re-roll a segment for a fresh take: set a new ``audio_seed``, clear its key, -> PENDING.
+
+    Stamps a new ``audio_seed`` (folded into :meth:`AudioCache.key_for` -> a new key -> a distinct
+    WAV, even when the project pins a global ``tts_params["seed"]``), nulls the stale
+    ``audio_cache_key`` and resets ``audio_status`` to PENDING — mirroring the synth FAILED
+    clear-key path so assemble never stitches the old take. The caller (:class:`ReviewService`)
+    then either renders the segment now (regenerate) or defers it to the next full run (reject).
+    """
+    segment.audio_seed = seed
+    segment.audio_cache_key = None
+    segment.audio_status = ReviewStatus.PENDING
+
+
+def fail_audio(segment: Segment) -> None:
+    """Mark a segment's render FAILED (clearing its key), mirroring the synth FAILED branch.
+
+    Used when a regenerate-now render fails: keeping the segment PENDING would make its row vanish
+    from the audio-review list (it is neither rendered nor failed), a silent black hole. FAILED is
+    **not** in ``RENDERED_STATUSES``, so the row stays visible with a failed badge **and** the next
+    full run re-renders it. The key is nulled so assemble never stitches a stale/absent WAV
+    (symmetric with :func:`reroll_audio` and ``synthesize_chapter``'s failure branch).
+    """
+    segment.audio_cache_key = None
+    segment.audio_status = ReviewStatus.FAILED

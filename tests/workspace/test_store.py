@@ -103,6 +103,37 @@ def test_audio_cache_key_with_none_voice_is_stable() -> None:
     )
 
 
+def test_audio_cache_key_unchanged_when_seed_is_none() -> None:
+    # Back-compat: an audio_seed of None (every pre-v3 segment) must leave the key BYTE-IDENTICAL
+    # to the three-arg key, so upgrading a v2 project invalidates no cached WAV.
+    base = AudioCache.compute_key("hello", "voice-1", {"seed": 1})
+    assert AudioCache.compute_key("hello", "voice-1", {"seed": 1}, None) == base
+
+
+def test_audio_cache_key_changes_with_a_non_none_seed() -> None:
+    # A re-rolled (non-None) seed folds into the key so exactly that segment re-renders.
+    base = AudioCache.compute_key("hello", "voice-1", {"seed": 1})
+    seeded = AudioCache.compute_key("hello", "voice-1", {"seed": 1}, 42)
+    assert seeded != base
+    # And two different seeds give two different keys (a re-roll always changes the take).
+    assert seeded != AudioCache.compute_key("hello", "voice-1", {"seed": 1}, 43)
+
+
+def test_audio_cache_key_for_folds_segment_audio_seed(
+    tmp_workspace: WorkspaceStore, sample_project: Project
+) -> None:
+    cache = AudioCache(tmp_workspace.layout)
+    seg = sample_project.book.chapters[0].lines[0].segments[1]  # Alice's line
+    before = cache.key_for(seg, sample_project)  # audio_seed defaults to None
+    seg.audio_seed = 99
+    after = cache.key_for(seg, sample_project)
+    assert before != after
+    speaker = next(s for s in sample_project.speakers if s.id == seg.speaker_id)
+    assert after == AudioCache.compute_key(
+        seg.text, speaker.voice_clip_id, sample_project.tts_params, 99
+    )
+
+
 def test_audio_cache_key_for_segment_uses_speaker_voice(
     tmp_workspace: WorkspaceStore, sample_project: Project
 ) -> None:

@@ -74,6 +74,11 @@ class Segment:
     review_status: ReviewStatus
     audio_cache_key: str | None = None  # -> AudioCache; None until synthesized
     audio_status: ReviewStatus = ReviewStatus.PENDING  # per-segment review
+    # Per-segment render seed, re-rolled on each audio-review "regenerate" so a fresh take
+    # differs even when the project pins a global ``tts_params["seed"]``. ``None`` (the default,
+    # and every pre-schema-v3 segment) means "use the global seed"; it is folded into the
+    # :class:`AudioCache` key ONLY when non-None, so an un-re-rolled segment keeps its old key.
+    audio_seed: int | None = None
 
 
 @dataclass

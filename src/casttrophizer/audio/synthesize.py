@@ -33,12 +33,14 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 from casttrophizer.audio.loudness import LoudnessSettings, normalize_wav_file
 from casttrophizer.domain.enums import ReviewStatus
 from casttrophizer.domain.models import (
     Chapter,
     Project,
+    Segment,
     Speaker,
     VoiceClip,
     find_narrator,
@@ -57,6 +59,7 @@ __all__ = [
     "unresolved_voices",
     "unresolved_speakers",
     "synthesize_chapter",
+    "render_segment",
 ]
 
 #: How often (in segments) ``synthesize_chapter`` polls the stop callback, with a partial
@@ -283,13 +286,8 @@ def synthesize_chapter(
                 advance(line.text[:40] or None)
                 continue
 
-            request = SynthesisRequest(
-                text=segment.text,
-                voice_clip_path=clip_path,
-                params=dict(project.tts_params),
-            )
             try:
-                tts.synthesize(request, cache.path_for_key(key))
+                _render_and_stamp(segment, project, clip_path, key, tts, cache, loudness)
             except TTSProviderError:
                 # Clear any stale key so a FAILED segment never points at an old WAV the
                 # assemble stage might stitch in. The skip gate already excludes FAILED, so
@@ -298,23 +296,98 @@ def synthesize_chapter(
                 segment.audio_status = ReviewStatus.FAILED
                 failed_any = True
             else:
-                # Normalize the just-rendered WAV to a consistent loudness before stamping the
-                # segment COMPLETED. A SKIPPED (cache-hit) segment is never re-normalized — its
-                # settings are in the cache key, so a settings change already forces a re-render.
-                # Normalization must never fail an otherwise-good render (log-and-continue: the
-                # segment stays COMPLETED with un-normalized audio).
-                if loudness is not None and loudness.enabled:
-                    try:
-                        normalize_wav_file(cache.path_for_key(key), loudness)
-                    except Exception:  # noqa: BLE001 - defensive; a normalize failure is non-fatal
-                        logger.warning(
-                            "loudness normalization failed for segment %s; keeping raw audio",
-                            segment.id,
-                            exc_info=True,
-                        )
-                segment.audio_cache_key = key
-                segment.audio_status = ReviewStatus.COMPLETED
                 rendered_any = True
             advance(line.text[:40] or None)
 
     return rendered_any, failed_any, False
+
+
+def _render_params(project: Project, segment: Segment) -> dict[str, Any]:
+    """The synthesis params for one segment: the project globals, seed-overridden if re-rolled.
+
+    Starts from ``project.tts_params`` and, **only when** the segment carries a re-rolled
+    ``audio_seed``, overrides ``params["seed"]`` with it (the Chatterbox provider seeds torch from
+    ``params["seed"]``). A ``None`` seed leaves the params byte-identical to the global dict, so an
+    un-re-rolled segment renders exactly as before — and hashes to the same cache key.
+    """
+    params = {**project.tts_params}
+    if segment.audio_seed is not None:
+        params["seed"] = segment.audio_seed
+    return params
+
+
+def _render_and_stamp(
+    segment: Segment,
+    project: Project,
+    clip_path: Path,
+    key: str,
+    tts: TTSProvider,
+    cache: AudioCache,
+    loudness: LoudnessSettings | None,
+) -> None:
+    """Render ``segment`` to ``cache.path_for_key(key)``, normalize, and stamp it COMPLETED.
+
+    The shared success-path body for both :func:`synthesize_chapter` (per-segment, wrapped in a
+    flag-and-continue ``except TTSProviderError``) and :func:`render_segment` (single-segment,
+    lets the error propagate). Builds the request via :func:`_render_params` (so both honour a
+    re-rolled seed), calls ``tts.synthesize`` (which may raise :class:`TTSProviderError` — NOT
+    caught here, so a failure never partially stamps), applies loudness normalization
+    (log-and-continue: a normalize failure never fails an otherwise-good render), then stamps
+    ``audio_cache_key``/``audio_status=COMPLETED``.
+    """
+    request = SynthesisRequest(
+        text=segment.text,
+        voice_clip_path=clip_path,
+        params=_render_params(project, segment),
+    )
+    tts.synthesize(request, cache.path_for_key(key))
+    # Normalize the just-rendered WAV to a consistent loudness before stamping the segment
+    # COMPLETED. A SKIPPED (cache-hit) segment is never re-normalized — its settings are in the
+    # cache key, so a settings change already forces a re-render. Normalization must never fail an
+    # otherwise-good render (log-and-continue: the segment stays COMPLETED with un-normalized WAV).
+    if loudness is not None and loudness.enabled:
+        try:
+            normalize_wav_file(cache.path_for_key(key), loudness)
+        except Exception:  # noqa: BLE001 - defensive; a normalize failure is non-fatal
+            logger.warning(
+                "loudness normalization failed for segment %s; keeping raw audio",
+                segment.id,
+                exc_info=True,
+            )
+    segment.audio_cache_key = key
+    segment.audio_status = ReviewStatus.COMPLETED
+
+
+def render_segment(
+    project: Project,
+    segment: Segment,
+    cache: AudioCache,
+    tts: TTSProvider,
+    *,
+    loudness: LoudnessSettings | None,
+) -> None:
+    """Render ONE segment now and stamp it (the audio-review "regenerate-now" render).
+
+    Mirrors :func:`synthesize_chapter`'s success branch for a single segment, so the review UI can
+    re-render exactly the segment the user rejected on a worker thread. Resolves the segment's
+    effective speaker -> voice clip path (the shared ``resolve_segment_speaker_id`` +
+    :func:`_resolved_clip_path` rule); a missing clip raises :class:`TTSProviderError`. Computes the
+    key via :meth:`AudioCache.key_for` (which folds ``audio_seed``), then delegates to
+    :func:`_render_and_stamp` (build request with the seed override -> ``tts.synthesize`` ->
+    loudness-normalize -> stamp ``audio_cache_key``/COMPLETED).
+
+    Qt-free and persistence-free: a :class:`TTSProviderError` (missing clip OR a model/synthesis
+    failure) propagates with **no partial stamp**, so the caller can leave the segment PENDING; the
+    caller persists after a success.
+    """
+    narrator = find_narrator(project)
+    speakers = _speaker_index(project)
+    voices = _voice_index(project)
+    sid = resolve_segment_speaker_id(segment, narrator)
+    speaker = speakers.get(sid) if sid else None
+    clip_path = _resolved_clip_path(speaker, voices)
+    if clip_path is None:
+        name = speaker.name if speaker is not None else "narrator"
+        raise TTSProviderError(f"no usable voice clip for speaker {name!r}")
+    key = cache.key_for(segment, project)
+    _render_and_stamp(segment, project, clip_path, key, tts, cache, loudness)

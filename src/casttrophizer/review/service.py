@@ -15,6 +15,7 @@ convention); the synthesize voice precheck is the final backstop regardless.
 
 from __future__ import annotations
 
+import secrets
 from pathlib import Path
 
 from casttrophizer.domain.enums import SpeakerRole, StageName, VoiceCategory
@@ -24,6 +25,23 @@ from casttrophizer.review.gate import ReviewBlockers, review_blockers
 from casttrophizer.workspace.store import WorkspaceStore
 
 __all__ = ["ReviewService"]
+
+#: torch accepts an int32 seed; draw from ``[1, 2**31 - 1)`` so ``manual_seed`` never sees 0 or an
+#: out-of-range value. Determinism is NOT wanted here — a re-roll must produce a *different* take —
+#: so any well-distributed source works; ``secrets`` gives one without seeding the global RNG.
+_SEED_MAX = 2**31 - 1
+
+
+def _new_seed(current: int | None) -> int:
+    """A fresh render seed in ``[1, 2**31 - 1)`` guaranteed to differ from ``current``.
+
+    Re-draws on the (astronomically unlikely) collision so a re-roll always changes the segment's
+    cache key -> a genuinely new take. ``current`` of ``None`` (never re-rolled) never collides.
+    """
+    seed = secrets.randbelow(_SEED_MAX - 1) + 1
+    while seed == current:
+        seed = secrets.randbelow(_SEED_MAX - 1) + 1
+    return seed
 
 
 class ReviewService:
@@ -213,4 +231,58 @@ class ReviewService:
         ``voice_clip_id``), so it cannot introduce a blocker and forces no re-render.
         """
         actions.set_speaker_category(speaker, category)
+        self._save()
+
+    # ----------------------------------------------------------------- #
+    # per-segment audio review (post-synthesize)
+    # ----------------------------------------------------------------- #
+    # Audio review runs AFTER synthesize, so none of these touch ``_invalidate_review`` — that flag
+    # gates the *pre-synth* criterion-1/2/3 review, which approving/re-rolling a rendered take
+    # cannot re-open. Approval is a pure curation marker (no render change); a re-roll re-opens only
+    # the render stages so the fresh take is (re-)synthesized and the M4B rebuilt.
+    def approve_audio(self, segment: Segment) -> None:
+        """Approve a rendered take (COMPLETED -> APPROVED) and persist — no invalidation.
+
+        A curation marker only: both statuses are ``RENDERED_STATUSES``, so this changes no render
+        input and re-opens nothing — assemble still stitches the same WAV. See the section note on
+        why ``_invalidate_review`` is deliberately untouched.
+        """
+        actions.approve_audio(segment)
+        self._save()
+
+    def reroll_audio(self, segment: Segment) -> None:
+        """Re-roll a segment (new seed, cleared key, PENDING), re-open the render stages, persist.
+
+        Draws a fresh :func:`_new_seed` (differs from the current one), applies
+        :func:`actions.reroll_audio`, then :meth:`_invalidate_render` so the next full run
+        re-synthesizes the segment (its key changed) and rebuilds the M4B. This is the shared first
+        step of both the audio panel's *reject* (defer to the next run) and *regenerate* (render
+        now) intents; the regenerate flow additionally renders the segment immediately and calls
+        :meth:`commit_rendered_audio`. No ``_invalidate_review`` (see the section note).
+        """
+        actions.reroll_audio(segment, seed=_new_seed(segment.audio_seed))
+        self._invalidate_render()
+        self._save()
+
+    def commit_rendered_audio(self, segment: Segment) -> None:
+        """Persist a segment the regenerate worker already stamped COMPLETED in memory.
+
+        The worker renders on a background thread and stamps ``audio_cache_key``/COMPLETED on the
+        shared :class:`Segment` (the queued finish signal provides the happens-before); this just
+        writes that to disk. ASSEMBLE stays popped from the preceding :meth:`reroll_audio`, so the
+        next full run cache-hits the now-current SYNTHESIZE and assemble rebuilds the M4B. Takes
+        ``segment`` for a symmetric signature (and a future stamp-on-main-thread variant); the save
+        is whole-project.
+        """
+        self._save()
+
+    def mark_audio_failed(self, segment: Segment) -> None:
+        """Mark a regenerate render FAILED (via :func:`actions.fail_audio`) and persist.
+
+        Called when the regenerate worker reports a failure: FAILED keeps the row visible (with a
+        badge) instead of a re-rolled PENDING segment silently vanishing from the list, and — being
+        outside ``RENDERED_STATUSES`` — it re-renders on the next full run. The render stages stay
+        popped from the preceding :meth:`reroll_audio`, so no extra invalidation is needed here.
+        """
+        actions.fail_audio(segment)
         self._save()

@@ -40,6 +40,7 @@ class FakeProjectView:
         self.review_available: list[bool] = []
         self.voice_available: list[bool] = []
         self.text_available: list[bool] = []
+        self.audio_available: list[bool] = []
         self.running: list[bool] = []
         self.progress: list[tuple[int, int, str]] = []
         self.outcomes: list[object] = []
@@ -62,6 +63,9 @@ class FakeProjectView:
 
     def set_text_available(self, available: bool) -> None:
         self.text_available.append(available)
+
+    def set_audio_available(self, available: bool) -> None:
+        self.audio_available.append(available)
 
     def set_running(self, running: bool) -> None:
         self.running.append(running)
@@ -443,6 +447,44 @@ def test_review_available_false_when_no_segments(
     presenter.open(tmp_workspace.layout.root)  # parse_ready_project has no segments yet
 
     assert view.review_available[-1] is False
+
+
+def test_audio_available_false_without_rendered_audio(
+    tmp_workspace: WorkspaceStore, review_ready_project: Project, tmp_path: Path
+) -> None:
+    # review_ready_project has segments but none synthesized -> audio review stays closed.
+    view = FakeProjectView()
+    presenter = _presenter(view, FakeRunExecutor(), _deps(tmp_path))
+
+    presenter.open(tmp_workspace.layout.root)
+
+    assert view.audio_available[-1] is False
+
+
+def test_audio_available_true_once_a_segment_is_rendered(
+    tmp_workspace: WorkspaceStore, assemble_ready_project: Project, tmp_path: Path
+) -> None:
+    # assemble_ready_project has COMPLETED segments (rendered) -> audio review opens.
+    view = FakeProjectView()
+    presenter = _presenter(view, FakeRunExecutor(), _deps(tmp_path))
+
+    presenter.open(tmp_workspace.layout.root)
+
+    assert view.audio_available[-1] is True
+
+
+def test_audio_cache_property_none_before_open_then_available(
+    tmp_workspace: WorkspaceStore, assemble_ready_project: Project, tmp_path: Path
+) -> None:
+    view = FakeProjectView()
+    presenter = _presenter(view, FakeRunExecutor(), _deps(tmp_path))
+    assert presenter.audio_cache is None  # no store adopted yet
+
+    presenter.open(tmp_workspace.layout.root)
+
+    cache = presenter.audio_cache
+    assert cache is not None
+    assert cache.path_for_key("abc").name == "abc.wav"  # resolves against the workspace layout
 
 
 def test_refresh_after_review_rerenders_needs_review_summary_from_disk(
