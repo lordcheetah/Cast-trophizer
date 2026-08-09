@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Tooling caches
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Project workspaces (per-project derived artifacts)
+workspaces/
+# Smoke-test / scratch workspaces (scripts/smoke_test.py --workdir)
+.smoke-out/
+# castrun default workdir "." dumps these into the repo root — ignore stray copies
+/project.json
+/audio/
+/output/
+/logs/
+# Local input assets (voice clips, cover images, source books)
+/voices/
+/covers/
+/books/
+/work/
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

@@ -1,0 +1,158 @@
+"""Airtight lazy-load guarantees for the provider/pipeline/domain layers (scaffold §9.1).
+
+The central architectural rule (CLAUDE.md + scaffold §1/§4): importing a concrete
+provider module, or any headless package, must **not** drag in the heavy/optional SDKs
+(``torch``, ``chatterbox``, ``anthropic``, ``openai``) or Qt (``PySide6``). Those are
+loaded lazily — only when a provider actually runs.
+
+Why a subprocess per import (and not just ``assert "torch" not in sys.modules``):
+
+* ``anthropic``/``openai``/``PySide6`` are *installed* in this environment, so a stray
+  top-level import would really land in ``sys.modules`` — but only a **fresh**
+  interpreter proves the target module itself is responsible. In a shared pytest
+  session another test could have already imported the SDK, masking a regression (false
+  pass) or, conversely, an unrelated import could trip an in-process assertion (false
+  fail). A clean child process removes that ordering coupling entirely.
+* ``torch``/``chatterbox`` are *not* installed here, so an in-process
+  ``not in sys.modules`` check passes trivially and proves nothing. The subprocess still
+  imports the target module successfully (proving it does not hard-require torch) and
+  then asserts the SDK never entered ``sys.modules`` — meaningful regardless of install
+  state.
+
+Each case runs ``python -c`` in an isolated interpreter; the child asserts and exits
+nonzero on violation, and the parent surfaces the child's stderr on failure.
+"""
+
+from __future__ import annotations
+
+import subprocess
+import sys
+import textwrap
+
+import pytest
+
+# (module-to-import, SDK-that-must-stay-absent) — the load-bearing guarantees.
+_LAZY_IMPORT_CASES: list[tuple[str, str]] = [
+    # Concrete LLM providers must not import their SDK at module load.
+    ("casttrophizer.providers.llm.claude", "anthropic"),
+    ("casttrophizer.providers.llm.lmstudio", "openai"),
+    # The TTS provider must not import torch/chatterbox at module load.
+    ("casttrophizer.providers.tts.chatterbox", "torch"),
+    ("casttrophizer.providers.tts.chatterbox", "chatterbox"),
+    ("casttrophizer.providers.tts.chatterbox", "torchaudio"),
+    # The synthesize orchestration + stage drive ``ctx.tts`` lazily — importing them must
+    # not drag in torch/chatterbox (the heavy TTS deps load only when a real provider runs).
+    ("casttrophizer.audio.synthesize", "torch"),
+    ("casttrophizer.audio.synthesize", "chatterbox"),
+    ("casttrophizer.pipeline.stages.synthesize", "torch"),
+    ("casttrophizer.pipeline.stages.synthesize", "chatterbox"),
+    # Loudness normalization keeps numpy/pyloudnorm lazy (imported only inside the measurement
+    # function), so importing the module — or the synthesize orchestration that uses it — must
+    # not load them. This is the guarantee that CI without the ``tts`` extra never needs them.
+    ("casttrophizer.audio.loudness", "numpy"),
+    ("casttrophizer.audio.loudness", "pyloudnorm"),
+    ("casttrophizer.audio.synthesize", "numpy"),
+    ("casttrophizer.audio.synthesize", "pyloudnorm"),
+    ("casttrophizer.audio.wavfile", "numpy"),
+    # config carries the loudness numeric defaults but must stay audio/numpy-free; the CLI
+    # seeds a project's loudness block from config yet must not drag in numpy/pyloudnorm/torch.
+    ("casttrophizer.config", "numpy"),
+    ("casttrophizer.config", "pyloudnorm"),
+    ("casttrophizer.cli", "numpy"),
+    ("casttrophizer.cli", "pyloudnorm"),
+    ("casttrophizer.cli", "torch"),
+    # The factory package re-exports ABCs only — no concrete SDK should appear.
+    ("casttrophizer.providers", "anthropic"),
+    ("casttrophizer.providers", "openai"),
+    ("casttrophizer.providers", "torch"),
+    ("casttrophizer.providers", "chatterbox"),
+    # Headless packages stay free of every heavy dep *and* of Qt.
+    ("casttrophizer.pipeline", "torch"),
+    ("casttrophizer.pipeline", "PySide6"),
+    ("casttrophizer.pipeline.stages", "anthropic"),
+    ("casttrophizer.pipeline.stages", "openai"),
+    # The offline attribution package (segmenter/policy/orchestration) must stay SDK-free; only
+    # the Claude provider — reached via ctx.llm, never imported here — may touch anthropic.
+    ("casttrophizer.attribution", "anthropic"),
+    ("casttrophizer.attribution", "openai"),
+    ("casttrophizer.pipeline.stages.attribute", "anthropic"),
+    ("casttrophizer.pipeline.stages.attribute", "openai"),
+    # The text-correction package must not load the spellcheck dictionary at import time
+    # (the heavy ``spellchecker`` import is deferred into the corrector, like ebooklib).
+    ("casttrophizer.text", "spellchecker"),
+    ("casttrophizer.text.spelling", "spellchecker"),  # the module that *wraps* it
+    ("casttrophizer.text.base", "spellchecker"),  # the policy seam stays dict-free
+    ("casttrophizer.text.ocr", "spellchecker"),  # OCR heuristics take an injected is_word
+    ("casttrophizer.pipeline.stages.correct", "spellchecker"),
+    ("casttrophizer.workspace", "PySide6"),
+    ("casttrophizer.domain", "PySide6"),
+    ("casttrophizer.domain", "torch"),
+    # The headless review package (gate/actions/service) + the review stage stay Qt-free
+    # and SDK-free: they are the operation layer the future PySide6 review UI calls, never
+    # the UI itself, and they never touch a real provider.
+    ("casttrophizer.review", "PySide6"),
+    ("casttrophizer.review", "anthropic"),
+    ("casttrophizer.review", "torch"),
+    ("casttrophizer.review", "chatterbox"),
+    ("casttrophizer.pipeline.stages.review", "PySide6"),
+    ("casttrophizer.pipeline.stages.review", "torch"),
+    ("casttrophizer.pipeline.stages.review", "chatterbox"),
+    # The assemble orchestration + assembler + stage import ffmpeg/mutagen only lazily inside
+    # the real assemble() call — importing the modules must pull in no mutagen/Qt/torch.
+    ("casttrophizer.audio.assembler", "mutagen"),
+    ("casttrophizer.audio.assembler", "PySide6"),
+    ("casttrophizer.audio.assemble", "mutagen"),
+    ("casttrophizer.audio.assemble", "PySide6"),
+    ("casttrophizer.pipeline.stages.assemble", "mutagen"),
+    ("casttrophizer.pipeline.stages.assemble", "PySide6"),
+    ("casttrophizer.pipeline.stages.assemble", "torch"),
+]
+
+
+def _import_in_clean_subprocess(module: str, forbidden: str) -> subprocess.CompletedProcess[str]:
+    """Import ``module`` in a fresh interpreter and assert ``forbidden`` never loads."""
+    code = textwrap.dedent(f"""
+        import sys
+        import importlib
+        importlib.import_module({module!r})
+        if {forbidden!r} in sys.modules:
+            sys.stderr.write(
+                "{forbidden} was imported as a side effect of importing {module}\\n"
+            )
+            raise SystemExit(1)
+        raise SystemExit(0)
+        """)
+    return subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+    )
+
+
+@pytest.mark.parametrize(
+    ("module", "forbidden"),
+    _LAZY_IMPORT_CASES,
+    ids=[f"{m}__no__{f}" for m, f in _LAZY_IMPORT_CASES],
+)
+def test_module_import_does_not_load_heavy_dep(module: str, forbidden: str) -> None:
+    proc = _import_in_clean_subprocess(module, forbidden)
+    assert proc.returncode == 0, (
+        f"importing {module} must not load {forbidden}.\n"
+        f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
+    )
+
+
+def test_subprocess_harness_actually_detects_a_violation() -> None:
+    """Meta-check: the harness reports failure when the forbidden dep IS imported.
+
+    Guards against a false-green harness (e.g. a typo making every case pass). We
+    deliberately import a stdlib module (``json``) that the target genuinely loads, and
+    confirm the child process flags it as present — proving the detection path works.
+    Uses ``json`` rather than an optional SDK so this stays offline and install-agnostic.
+    """
+    proc = _import_in_clean_subprocess("casttrophizer.workspace.store", "json")
+    assert proc.returncode == 1, (
+        "harness failed to detect a dep that the target really imports; "
+        "the lazy-import assertions may be silently passing.\n"
+        f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
+    )

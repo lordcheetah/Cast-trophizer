@@ -1,0 +1,77 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "cast-trophizer"
+version = "0.1.0"
+description = "Convert ebooks into full-cast audiobooks using Chatterbox TTS."
+requires-python = ">=3.11"
+readme = "README.md"
+dependencies = [
+    "PySide6>=6.6",            # Qt GUI
+    "ebooklib>=0.18",         # EPUB parsing
+    "beautifulsoup4>=4.12",   # HTML extraction within EPUB
+    "pyspellchecker>=0.8",    # offline spellcheck (bundled dict) for text correction
+    "mutagen>=1.47",          # M4B tagging / chapters / cover
+    "anthropic>=0.39",        # primary LLM provider (Claude)
+    "openai>=1.40",           # backup LLM via LM Studio OpenAI-compatible endpoint
+]
+# Note: ffmpeg is an external binary dependency (not pip). Documented in README;
+# AssembleStage shells out to it.
+
+[project.optional-dependencies]
+# Heavy torch-based TTS gated behind an extra so dev/CI installs stay light.
+# Import path: `from chatterbox.tts import ChatterboxTTS` (dist: chatterbox-tts).
+tts = [
+    "chatterbox-tts",
+    "pyloudnorm",              # ITU-R BS.1770 loudness for per-segment normalization
+    # (already a transitive dep of chatterbox-tts; listed explicitly to make it intentional).
+    # numpy arrives via torch. Both are lazy-imported inside audio/loudness.py.
+]
+dev = [
+    "pytest>=8",
+    "pytest-mock>=3.12",
+    "ruff>=0.6",
+    "black>=24",
+    "mypy>=1.11",
+]
+
+[project.scripts]
+casttrophizer = "casttrophizer.ui.app:main"
+castrun = "casttrophizer.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/casttrophizer"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.black]
+line-length = 100
+target-version = ["py311"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+files = ["src"]
+
+# Third-party libs (EPUB/HTML, spellcheck, TTS/torch) ship no type stubs; import untyped.
+[[tool.mypy.overrides]]
+module = [
+    "ebooklib", "ebooklib.*", "bs4", "bs4.*", "spellchecker", "spellchecker.*",
+    "chatterbox", "chatterbox.*", "torch", "torch.*", "torchaudio", "torchaudio.*",
+    "pyloudnorm", "pyloudnorm.*",
+]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+# "src" makes the package importable; "." puts the repo root on sys.path so conftest's
+# `from tests.data...` imports work under the bare `pytest` entrypoint (not just `python -m pytest`).
+pythonpath = ["src", "."]
+testpaths = ["tests"]
+addopts = "-q"

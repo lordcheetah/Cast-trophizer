@@ -16,9 +16,13 @@ Convert ebooks into **full-cast audiobooks** using [Chatterbox](https://github.c
 - **TTS:** Chatterbox (voice cloning from user-provided reference clips)
 - **GUI:** PySide6 (Qt for Python) — desktop, single-user, handles large local audio/ebook files
 - **Ebook parsing:** `ebooklib` + `BeautifulSoup` for EPUB; design the parser behind an interface so other formats can be added
-- **Speaker attribution:** pluggable LLM provider (Claude API or local model) — **LLM proposes, user confirms**. Low-confidence attributions must be flagged, never silently committed.
+- **Speaker attribution:** pluggable LLM provider — **LLM proposes, user confirms**. Low-confidence attributions must be flagged, never silently committed.
+  - **Primary provider: Claude API** (Anthropic SDK).
+  - **Backup provider: LM Studio** (local, OpenAI-compatible endpoint). Note: a local model like Qwen 2.5 32B Instruct makes obvious attribution mistakes, so the backup is a fallback, not the default — keep the review/confirm UX strong enough that a weaker model is still usable.
 - **Text correction:** automated pass (spellcheck + OCR-artifact heuristics) that only auto-applies high-confidence fixes; everything else is surfaced as a suggestion the user accepts/rejects.
-- **Audiobook assembly:** `ffmpeg` + `mutagen` → M4B with chapters + embedded cover.
+- **TTS render unit: per-segment.** Each line is split into attributable segments (narration vs. inline quotes); each segment is rendered with its own voice and the per-segment audio is keyed/cached and stitched back in order during assembly. This is what enables full-cast voicing of mixed paragraphs.
+- **State serialization: stdlib dataclasses + manual `to_dict`/`from_dict`** with a `schema_version` (no pydantic). Zero extra runtime deps, easy to mock; a future switch to pydantic stays isolated to `domain/`.
+- **Audiobook assembly:** `ffmpeg` + `mutagen` → M4B with chapters + embedded cover. `ffmpeg` is an external binary prerequisite (documented in README, not a pip dep).
 - **Audio playback (review UI):** Qt multimedia.
 
 ## Architecture principles
